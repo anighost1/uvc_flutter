@@ -4,6 +4,9 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter_ffi_uvc/flutter_ffi_uvc.dart';
 
+import 'dart:typed_data';
+import 'package:panorama_viewer/panorama_viewer.dart';
+
 void main() {
   runApp(
     MaterialApp(
@@ -31,7 +34,8 @@ class _X5PageState extends State<X5Page> {
   bool _busy = false;
   bool _streaming = false;
   bool _quality = false; // true = try the largest mode (2880x1440) first
-  ui.Image? _snap; // snapshot of the raw frame, drawn without the Texture
+  ui.Image? _snap;
+  Uint8List? _jpgBytes;
 
   Timer? _poll;
   StreamSubscription<UvcStreamError>? _errSub;
@@ -90,9 +94,15 @@ class _X5PageState extends State<X5Page> {
       frame.width,
       frame.height,
       ui.PixelFormat.rgba8888,
-      (ui.Image img) {
-        if (!mounted) return;
-        setState(() => _snap = img);
+      (ui.Image img) async {
+        final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
+
+        if (!mounted || byteData == null) return;
+
+        setState(() {
+          _snap = img;
+          _jpgBytes = byteData.buffer.asUint8List();
+        });
       },
     );
   }
@@ -169,7 +179,7 @@ class _X5PageState extends State<X5Page> {
       );
 
       _poll = Timer.periodic(
-        const Duration(seconds: 2),
+        const Duration(milliseconds: 100),
         (_) => _inspectFrame(),
       );
     } catch (e) {
@@ -225,14 +235,16 @@ class _X5PageState extends State<X5Page> {
       body: Column(
         children: [
           // 1) The Texture (what the plugin draws directly)
-          AspectRatio(
-            aspectRatio: _w / _h,
-            child: Container(
-              color: Colors.black,
-              child: _textureId == null
-                  ? const Center(child: Text('No preview'))
-                  : Texture(textureId: _textureId!),
-            ),
+          SizedBox(
+            height: 280,
+            child: _jpgBytes == null
+                ? const Center(child: Text('Waiting for frames'))
+                : PanoramaViewer(
+                    minZoom: 0.5,
+                    maxZoom: 5,
+                    animSpeed: 0.0,
+                    child: Image.memory(_jpgBytes!, gaplessPlayback: true),
+                  ),
           ),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
