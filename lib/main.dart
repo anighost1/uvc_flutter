@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter_ffi_uvc/flutter_ffi_uvc.dart';
 
 void main() {
@@ -21,7 +23,7 @@ class X5Page extends StatefulWidget {
   State<X5Page> createState() => _X5PageState();
 }
 
-class _X5PageState extends State<X5Page> {
+class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
   final List<String> _lines = [];
   final ScrollController _scroll = ScrollController();
 
@@ -30,10 +32,22 @@ class _X5PageState extends State<X5Page> {
   int _h = 9;
   bool _busy = false;
   bool _streaming = false;
-  bool _quality = false; // true = try the largest mode (2880x1440) first
-  ui.Image? _snap; // snapshot of the raw frame, drawn without the Texture
+  bool _view360 = true; // true = shader 360 view, false = flat GPU texture
 
-  Timer? _poll;
+  // Realtime 360 rendering
+  final ValueNotifier<ui.Image?> _frameImg = ValueNotifier(null);
+  final ValueNotifier<int> _viewTick = ValueNotifier(0);
+  ui.FragmentShader? _shader;
+  late final Ticker _ticker;
+  bool _grabbing = false;
+  double _yaw = 0, _pitch = 0, _fov = 1.2; // radians
+  double _fovAtScaleStart = 1.2;
+
+  // FPS counter (updates once a second, no per-frame setState)
+  final ValueNotifier<String> _fpsText = ValueNotifier('');
+  int _frameCount = 0;
+  DateTime _fpsStamp = DateTime.now();
+
   StreamSubscription<UvcStreamError>? _errSub;
   StreamSubscription<UvcDeviceEvent>? _devSub;
   StreamSubscription<UvcStallEvent>? _stallSub;
@@ -55,6 +69,17 @@ class _X5PageState extends State<X5Page> {
   @override
   void initState() {
     super.initState();
+    _ticker = createTicker((_) => _grab());
+
+    ui.FragmentProgram.fromAsset('shaders/pano.frag')
+        .then((p) {
+          if (!mounted) return;
+          setState(() => _shader = p.fragmentShader());
+        })
+        .catchError((e) {
+          _log('Shader load failed: $e');
+        });
+
     _errSub = uvcCamera.streamErrors.listen(
       (UvcStreamError e) => _log('STREAM ERROR: ${e.message}'),
     );
@@ -63,38 +88,118 @@ class _X5PageState extends State<X5Page> {
     );
   }
 
-  // Looks at the raw frame: average brightness + a snapshot to draw
-  void _inspectFrame() {
+  // Frames wider than this are downscaled before the GPU upload.
+  static const int _maxUploadW = 2880;
+  static const int _maxInFlight = 3; // frames decoding/uploading in parallel
+  static const int _grabIntervalMs = 20; // poll the camera at most ~50x/s
+
+  final Stopwatch _clock = Stopwatch()..start();
+  int _lastGrabMs = 0;
+  int _inFlight = 0;
+  int _seqIssued = 0;
+  int _seqShown = 0;
+  int _lastSig = 0;
+  int _grabs = 0; // copies done this second
+  int _srcUnique = 0; // distinct camera frames seen this second
+  int _copyUsAcc = 0;
+  int _decodeUsAcc = 0;
+  int _srcW = 0, _srcH = 0;
+
+  // Called every vsync while streaming in 360 mode.
+  void _grab() {
+    if (!_view360) return;
+    _report();
+    if (_inFlight >= _maxInFlight) return;
+    final nowMs = _clock.elapsedMilliseconds;
+    if (nowMs - _lastGrabMs < _grabIntervalMs) return;
+    _lastGrabMs = nowMs;
+
+    final sw = Stopwatch()..start();
     final frame = uvcCamera.copyLatestFrame();
-    if (frame == null) {
-      _log('frame check: no frame yet');
+    if (frame == null) return;
+    final bytes = frame.rgbaBytes;
+    _copyUsAcc += sw.elapsedMicroseconds;
+    _grabs++;
+
+    // Cheap signature from ~2k sampled bytes: if the camera has not produced a
+    // new frame yet, don't decode and upload the same picture again.
+    int sig = 17;
+    final step = ((bytes.length ~/ 2048) & ~3) + 5;
+    for (int i = 0; i < bytes.length; i += step) {
+      sig = (sig * 31 + bytes[i]) & 0x3fffffff;
+    }
+    if (sig == _lastSig) return;
+    _lastSig = sig;
+    _srcUnique++;
+    _srcW = frame.width;
+    _srcH = frame.height;
+
+    _inFlight++;
+    _decode(bytes, frame.width, frame.height, ++_seqIssued);
+  }
+
+  Future<void> _decode(Uint8List bytes, int w, int h, int seq) async {
+    final sw = Stopwatch()..start();
+    ui.Image img;
+    try {
+      final buf = await ui.ImmutableBuffer.fromUint8List(bytes);
+      final desc = ui.ImageDescriptor.raw(
+        buf,
+        width: w,
+        height: h,
+        pixelFormat: ui.PixelFormat.rgba8888,
+      );
+      final down = w > _maxUploadW;
+      final codec = await desc.instantiateCodec(
+        targetWidth: down ? _maxUploadW : null,
+        targetHeight: down ? (h * _maxUploadW / w).round() : null,
+      );
+      final fi = await codec.getNextFrame();
+      img = fi.image;
+      codec.dispose();
+      desc.dispose();
+      buf.dispose();
+    } catch (e) {
+      _inFlight--;
+      _log('decode error: $e');
       return;
     }
-    final b = frame.rgbaBytes;
-    int sum = 0;
-    int n = 0;
-    int maxV = 0;
-    for (int i = 0; i + 2 < b.length; i += 4 * 997) {
-      final v = (b[i] + b[i + 1] + b[i + 2]) ~/ 3;
-      sum += v;
-      n++;
-      if (v > maxV) maxV = v;
-    }
-    final avg = n == 0 ? 0 : sum / n;
-    _log(
-      'frame ${frame.width}x${frame.height}  brightness avg ${avg.toStringAsFixed(1)} / max $maxV (0-255)',
-    );
+    _inFlight--;
 
-    ui.decodeImageFromPixels(
-      b,
-      frame.width,
-      frame.height,
-      ui.PixelFormat.rgba8888,
-      (ui.Image img) {
-        if (!mounted) return;
-        setState(() => _snap = img);
-      },
-    );
+    // drop frames that finished out of order or after dispose
+    if (!mounted || seq < _seqShown) {
+      img.dispose();
+      return;
+    }
+    _seqShown = seq;
+
+    final old = _frameImg.value;
+    _frameImg.value = img; // only the painter repaints, no setState
+    WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
+
+    _decodeUsAcc += sw.elapsedMicroseconds;
+    _frameCount++;
+  }
+
+  // Once a second: "cam" = distinct frames the camera delivered,
+  // "show" = frames actually put on screen.
+  void _report() {
+    final now = DateTime.now();
+    final ms = now.difference(_fpsStamp).inMilliseconds;
+    if (ms < 1000) return;
+    final shown = _frameCount;
+    _fpsText.value =
+        '${_srcW}x$_srcH  '
+        'cam ${(_srcUnique * 1000 / ms).toStringAsFixed(1)} fps  '
+        'show ${(shown * 1000 / ms).toStringAsFixed(1)} fps  '
+        'copy ${_grabs == 0 ? 0 : (_copyUsAcc / _grabs / 1000).toStringAsFixed(1)}ms  '
+        'decode ${shown == 0 ? 0 : (_decodeUsAcc / shown / 1000).toStringAsFixed(1)}ms';
+    _frameCount = 0;
+    _srcUnique = 0;
+    _grabs = 0;
+    _copyUsAcc = 0;
+    _decodeUsAcc = 0;
+    _fpsStamp = now;
   }
 
   Future<void> _start() async {
@@ -128,9 +233,7 @@ class _X5PageState extends State<X5Page> {
 
       final tex = await uvcCamera.createPreviewTexture();
       final res = await uvcCamera.startPreviewAuto(
-        preference: _quality
-            ? UvcAutoPreviewPreference.quality
-            : UvcAutoPreviewPreference.reliability,
+        preference: UvcAutoPreviewPreference.quality,
       );
       for (final a in res.attempts) {
         _log(
@@ -168,10 +271,9 @@ class _X5PageState extends State<X5Page> {
         (UvcStallEvent e) => _log('STALL event: ${e.type}'),
       );
 
-      _poll = Timer.periodic(
-        const Duration(seconds: 2),
-        (_) => _inspectFrame(),
-      );
+      _frameCount = 0;
+      _fpsStamp = DateTime.now();
+      if (!_ticker.isActive) _ticker.start();
     } catch (e) {
       _log('ERROR: $e');
     } finally {
@@ -180,8 +282,7 @@ class _X5PageState extends State<X5Page> {
   }
 
   Future<void> _stop() async {
-    _poll?.cancel();
-    _poll = null;
+    if (_ticker.isActive) _ticker.stop();
     await _stallSub?.cancel();
     _stallSub = null;
     try {
@@ -203,7 +304,6 @@ class _X5PageState extends State<X5Page> {
       setState(() {
         _textureId = null;
         _streaming = false;
-        _snap = null;
       });
     }
     _log('Stopped');
@@ -213,9 +313,61 @@ class _X5PageState extends State<X5Page> {
   void dispose() {
     _errSub?.cancel();
     _devSub?.cancel();
+    _ticker.dispose();
     _stop();
+    _frameImg.value?.dispose();
+    _frameImg.dispose();
+    _viewTick.dispose();
+    _fpsText.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  Widget _buildPreview() {
+    if (!_streaming) {
+      return const Center(child: Text('Press Start'));
+    }
+
+    // Flat equirectangular view straight from the GPU texture. No copies.
+    if (!_view360) {
+      if (_textureId == null) return const SizedBox.shrink();
+      return Center(
+        child: AspectRatio(
+          aspectRatio: _w / _h,
+          child: Texture(textureId: _textureId!),
+        ),
+      );
+    }
+
+    // Realtime 360 perspective view via fragment shader.
+    if (_shader == null) {
+      return const Center(child: Text('Loading shader'));
+    }
+    return GestureDetector(
+      onScaleStart: (_) => _fovAtScaleStart = _fov,
+      onScaleUpdate: (d) {
+        _yaw -= d.focalPointDelta.dx * 0.005 * _fov;
+        _pitch = (_pitch - d.focalPointDelta.dy * 0.005 * _fov).clamp(
+          -1.5,
+          1.5,
+        );
+        if (d.scale != 1.0) {
+          _fov = (_fovAtScaleStart / d.scale).clamp(0.5, 2.2);
+        }
+        _viewTick.value++;
+      },
+      child: CustomPaint(
+        size: Size.infinite,
+        painter: PanoPainter(
+          _shader!,
+          _frameImg,
+          () => _yaw,
+          () => _pitch,
+          () => _fov,
+          Listenable.merge([_frameImg, _viewTick]),
+        ),
+      ),
+    );
   }
 
   @override
@@ -224,48 +376,55 @@ class _X5PageState extends State<X5Page> {
       appBar: AppBar(title: const Text('X5 UVC test')),
       body: Column(
         children: [
-          // 1) The Texture (what the plugin draws directly)
-          AspectRatio(
-            aspectRatio: _w / _h,
-            child: Container(
-              color: Colors.black,
-              child: _textureId == null
-                  ? const Center(child: Text('No preview'))
-                  : Texture(textureId: _textureId!),
+          SizedBox(
+            height: 300,
+            width: double.infinity,
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: ColoredBox(
+                    color: const Color(0xFF0B0D0F),
+                    child: _buildPreview(),
+                  ),
+                ),
+                Positioned(
+                  left: 8,
+                  top: 8,
+                  child: ValueListenableBuilder<String>(
+                    valueListenable: _fpsText,
+                    builder: (_, t, __) => Text(
+                      t,
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Colors.greenAccent,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            child: Row(
+            child: Wrap(
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 8,
               children: [
                 FilledButton(
                   onPressed: (_busy || _streaming) ? null : _start,
                   child: const Text('Start'),
                 ),
-                const SizedBox(width: 8),
                 OutlinedButton(
                   onPressed: _streaming ? _stop : null,
                   child: const Text('Stop'),
                 ),
-                const Spacer(),
-                const Text('Max quality'),
+                const Text('360'),
                 Switch(
-                  value: _quality,
-                  onChanged: _streaming
-                      ? null
-                      : (v) => setState(() => _quality = v),
+                  value: _view360,
+                  onChanged: (v) => setState(() => _view360 = v),
                 ),
               ],
             ),
-          ),
-          // 2) A snapshot of the raw frame, drawn by Flutter itself
-          Container(
-            height: 120,
-            width: double.infinity,
-            color: const Color(0xFF0B0D0F),
-            child: _snap == null
-                ? const Center(child: Text('Snapshot appears here'))
-                : RawImage(image: _snap, fit: BoxFit.contain),
           ),
           Expanded(
             child: Container(
@@ -291,4 +450,38 @@ class _X5PageState extends State<X5Page> {
       ),
     );
   }
+}
+
+class PanoPainter extends CustomPainter {
+  PanoPainter(
+    this.shader,
+    this.img,
+    this.yaw,
+    this.pitch,
+    this.fov,
+    Listenable repaint,
+  ) : super(repaint: repaint);
+
+  final ui.FragmentShader shader;
+  final ValueNotifier<ui.Image?> img;
+  final double Function() yaw;
+  final double Function() pitch;
+  final double Function() fov;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final i = img.value;
+    if (i == null) return;
+    shader
+      ..setFloat(0, size.width)
+      ..setFloat(1, size.height)
+      ..setFloat(2, yaw())
+      ..setFloat(3, pitch())
+      ..setFloat(4, fov())
+      ..setImageSampler(0, i);
+    canvas.drawRect(Offset.zero & size, Paint()..shader = shader);
+  }
+
+  @override
+  bool shouldRepaint(covariant PanoPainter old) => false; // driven by `repaint`
 }
