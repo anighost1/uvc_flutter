@@ -7,6 +7,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter_ffi_uvc/flutter_ffi_uvc.dart';
 
+import 'detection.dart';
+
 void main() {
   runApp(
     MaterialApp(
@@ -71,6 +73,19 @@ class _X5PageState extends State<X5Page>
   int _decodeUsAcc = 0;
   int _srcW = 0, _srcH = 0;
 
+  // ---- detection API ----
+  final DetectionClient _api = DetectionClient();
+  final ValueNotifier<List<Detection>> _dets = ValueNotifier(const []);
+  bool _apiOn = true;
+  bool _apiBusy = false;
+  int _nextApiMs = 0;
+  int _detAtMs = 0;
+  int _apiFailStreak = 0;
+  int _apiOk = 0;
+  int _apiMsAcc = 0;
+  int _apiErr = 0;
+  String _apiLastErr = '';
+
   // ---- stream errors are counted, then logged once a second ----
   int _errCount = 0;
   String _lastErr = '';
@@ -97,6 +112,8 @@ class _X5PageState extends State<X5Page>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _ticker = createTicker((_) => _grab());
+    _api.onLog = _log;
+    _api.connect();
 
     ui.FragmentProgram.fromAsset('shaders/pano.frag')
         .then((p) {
@@ -175,7 +192,17 @@ class _X5PageState extends State<X5Page>
 
   Future<void> _decode(Uint8List bytes, int w, int h, int seq) async {
     final sw = Stopwatch()..start();
+
+    // When it is time to ask the API, also make a small copy of this frame.
+    final wantApi =
+        _apiOn &&
+        _api.ready &&
+        !_apiBusy &&
+        _clock.elapsedMilliseconds >= _nextApiMs;
+    if (wantApi) _apiBusy = true;
+
     ui.Image img;
+    ui.Image? small;
     try {
       final buf = await ui.ImmutableBuffer.fromUint8List(bytes);
       final desc = ui.ImageDescriptor.raw(
@@ -189,13 +216,24 @@ class _X5PageState extends State<X5Page>
         targetWidth: down ? _maxUploadW : null,
         targetHeight: down ? (h * _maxUploadW / w).round() : null,
       );
-      final fi = await codec.getNextFrame();
-      img = fi.image;
+      img = (await codec.getNextFrame()).image;
       codec.dispose();
+
+      if (wantApi) {
+        final sendW = ApiConfig.sendWidth < w ? ApiConfig.sendWidth : w;
+        final sendH = (h * sendW / w).round();
+        final c2 = await desc.instantiateCodec(
+          targetWidth: sendW,
+          targetHeight: sendH,
+        );
+        small = (await c2.getNextFrame()).image;
+        c2.dispose();
+      }
       desc.dispose();
       buf.dispose();
     } catch (e) {
       _inFlight--;
+      if (wantApi) _apiBusy = false;
       _log('decode error: $e');
       return;
     }
@@ -204,6 +242,8 @@ class _X5PageState extends State<X5Page>
     // drop frames that finished out of order or after dispose
     if (_disposed || seq < _seqShown) {
       img.dispose();
+      small?.dispose();
+      if (wantApi) _apiBusy = false;
       return;
     }
     _seqShown = seq;
@@ -214,6 +254,46 @@ class _X5PageState extends State<X5Page>
 
     _decodeUsAcc += sw.elapsedMicroseconds;
     _shownCount++;
+
+    if (small != null) unawaited(_detect(small));
+  }
+
+  // Encode the small frame, send it to the API, store the outlines.
+  Future<void> _detect(ui.Image small) async {
+    final sw = Stopwatch()..start();
+    bool failed = false;
+    try {
+      final w = small.width, h = small.height;
+      ByteData? bd;
+      try {
+        bd = await small.toByteData(format: ui.ImageByteFormat.rawRgba);
+      } finally {
+        small.dispose();
+      }
+      if (bd == null) throw 'could not read frame pixels';
+      final rgba = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
+
+      final dataUrl = await encodeJpegDataUrl(rgba, w, h);
+      final result = await _api.detect(dataUrl, w, h);
+      if (_disposed) return;
+
+      _dets.value = result;
+      _detAtMs = _clock.elapsedMilliseconds;
+      _apiOk++;
+      _apiMsAcc += sw.elapsedMilliseconds;
+      _apiFailStreak = 0;
+    } catch (e) {
+      failed = true;
+      _apiErr++;
+      _apiLastErr = '$e';
+      _apiFailStreak++;
+    } finally {
+      _apiBusy = false;
+      final wait = failed
+          ? (250 * _apiFailStreak).clamp(250, 2000).toInt()
+          : ApiConfig.minIntervalMs;
+      _nextApiMs = _clock.elapsedMilliseconds + wait;
+    }
   }
 
   // Runs once a second.
@@ -221,6 +301,15 @@ class _X5PageState extends State<X5Page>
     if (_errCount > 0) {
       _log('STREAM ERROR x$_errCount: $_lastErr');
       _errCount = 0;
+    }
+    if (_apiErr > 0) {
+      _log('API ERROR x$_apiErr: $_apiLastErr');
+      _apiErr = 0;
+    }
+    // remove outlines that have not been refreshed
+    if (_dets.value.isNotEmpty &&
+        _clock.elapsedMilliseconds - _detAtMs > ApiConfig.resultTtlMs) {
+      _dets.value = const [];
     }
     if (!_streaming || !_view360) {
       if (_fpsText.value.isNotEmpty) _fpsText.value = '';
@@ -231,17 +320,21 @@ class _X5PageState extends State<X5Page>
     if (ms <= 0) return;
     final copyMs = _grabs == 0 ? 0.0 : _copyUsAcc / _grabs / 1000;
     final decMs = _shownCount == 0 ? 0.0 : _decodeUsAcc / _shownCount / 1000;
+    final apiMs = _apiOk == 0 ? 0 : (_apiMsAcc / _apiOk).round();
     _fpsText.value =
         '${_srcW}x$_srcH  '
         'cam ${(_srcUnique * 1000 / ms).toStringAsFixed(1)}  '
         'show ${(_shownCount * 1000 / ms).toStringAsFixed(1)} fps  '
         'copy ${copyMs.toStringAsFixed(0)}ms  '
-        'decode ${decMs.toStringAsFixed(0)}ms';
+        'decode ${decMs.toStringAsFixed(0)}ms'
+        '${_apiOn ? '\napi ${(_apiOk * 1000 / ms).toStringAsFixed(1)}/s ${apiMs}ms  ${_dets.value.length} objects' : ''}';
     _shownCount = 0;
     _srcUnique = 0;
     _grabs = 0;
     _copyUsAcc = 0;
     _decodeUsAcc = 0;
+    _apiOk = 0;
+    _apiMsAcc = 0;
     _fpsStamp = now;
   }
 
@@ -326,6 +419,8 @@ class _X5PageState extends State<X5Page>
       _decodeUsAcc = 0;
       _dupStreak = 0;
       _nextGrabMs = 0;
+      _nextApiMs = 0;
+      _apiFailStreak = 0;
       if (!_ticker.isActive) _ticker.start();
     } catch (e) {
       _log('ERROR: $e');
@@ -336,6 +431,7 @@ class _X5PageState extends State<X5Page>
 
   Future<void> _stop() async {
     if (_ticker.isActive) _ticker.stop();
+    if (!_disposed) _dets.value = const [];
     await _stallSub?.cancel();
     _stallSub = null;
     try {
@@ -374,6 +470,8 @@ class _X5PageState extends State<X5Page>
     _frameImg.value?.dispose();
     _frameImg.dispose();
     _viewTick.dispose();
+    _api.close();
+    _dets.dispose();
     _fpsText.dispose();
     _logTick.dispose();
     _scroll.dispose();
@@ -417,18 +515,37 @@ class _X5PageState extends State<X5Page>
         }
         _viewTick.value++;
       },
-      child: RepaintBoundary(
-        child: CustomPaint(
-          size: Size.infinite,
-          painter: PanoPainter(
-            _shader!,
-            _frameImg,
-            () => _yaw,
-            () => _pitch,
-            () => _fov,
-            Listenable.merge([_frameImg, _viewTick]),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          RepaintBoundary(
+            child: CustomPaint(
+              size: Size.infinite,
+              painter: PanoPainter(
+                _shader!,
+                _frameImg,
+                () => _yaw,
+                () => _pitch,
+                () => _fov,
+                Listenable.merge([_frameImg, _viewTick]),
+              ),
+            ),
           ),
-        ),
+          IgnorePointer(
+            child: RepaintBoundary(
+              child: CustomPaint(
+                size: Size.infinite,
+                painter: OutlinePainter(
+                  _dets,
+                  () => _yaw,
+                  () => _pitch,
+                  () => _fov,
+                  Listenable.merge([_dets, _viewTick]),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -481,10 +598,28 @@ class _X5PageState extends State<X5Page>
                   onPressed: _streaming ? _stop : null,
                   child: const Text('Stop'),
                 ),
-                const Text('360°'),
+                const Text('360'),
                 Switch(
                   value: _view360,
                   onChanged: (v) => setState(() => _view360 = v),
+                ),
+                const Text('Detect'),
+                Switch(
+                  value: _apiOn,
+                  onChanged: (v) {
+                    setState(() => _apiOn = v);
+                    if (!v) _dets.value = const [];
+                  },
+                ),
+                ValueListenableBuilder<bool>(
+                  valueListenable: _api.connected,
+                  builder: (_, c, __) => Text(
+                    c ? 'Server: connected' : 'Server: offline',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: c ? Colors.greenAccent : Colors.redAccent,
+                    ),
+                  ),
                 ),
               ],
             ),
