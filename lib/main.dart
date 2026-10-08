@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter_ffi_uvc/flutter_ffi_uvc.dart';
@@ -23,10 +24,15 @@ class X5Page extends StatefulWidget {
   State<X5Page> createState() => _X5PageState();
 }
 
-class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
+class _X5PageState extends State<X5Page>
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  // ---- log pane (rebuilds only itself, never the whole page) ----
   final List<String> _lines = [];
+  final ValueNotifier<int> _logTick = ValueNotifier(0);
   final ScrollController _scroll = ScrollController();
+  bool _disposed = false;
 
+  // ---- camera state ----
   int? _textureId;
   int _w = 16;
   int _h = 9;
@@ -34,19 +40,40 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
   bool _streaming = false;
   bool _view360 = true; // true = shader 360 view, false = flat GPU texture
 
-  // Realtime 360 rendering
+  // ---- realtime 360 rendering ----
   final ValueNotifier<ui.Image?> _frameImg = ValueNotifier(null);
   final ValueNotifier<int> _viewTick = ValueNotifier(0);
   ui.FragmentShader? _shader;
   late final Ticker _ticker;
-  bool _grabbing = false;
   double _yaw = 0, _pitch = 0, _fov = 1.2; // radians
   double _fovAtScaleStart = 1.2;
 
-  // FPS counter (updates once a second, no per-frame setState)
+  // ---- frame pipeline ----
+  static const int _maxUploadW = 2880; // frames wider than this get downscaled
+  static const int _maxInFlight = 2; // frames decoding/uploading in parallel
+
+  final Stopwatch _clock = Stopwatch()..start();
+  int _nextGrabMs = 0;
+  int _dupStreak = 0;
+  int _inFlight = 0;
+  int _seqIssued = 0;
+  int _seqShown = 0;
+  int _lastSig = 0;
+
+  // ---- stats (updated once a second by a timer, not per frame) ----
   final ValueNotifier<String> _fpsText = ValueNotifier('');
-  int _frameCount = 0;
+  Timer? _statsTimer;
   DateTime _fpsStamp = DateTime.now();
+  int _shownCount = 0;
+  int _grabs = 0;
+  int _srcUnique = 0;
+  int _copyUsAcc = 0;
+  int _decodeUsAcc = 0;
+  int _srcW = 0, _srcH = 0;
+
+  // ---- stream errors are counted, then logged once a second ----
+  int _errCount = 0;
+  String _lastErr = '';
 
   StreamSubscription<UvcStreamError>? _errSub;
   StreamSubscription<UvcDeviceEvent>? _devSub;
@@ -54,13 +81,12 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
 
   void _log(String s) {
     debugPrint('X5 $s');
-    if (!mounted) return;
-    setState(() {
-      _lines.add(s);
-      if (_lines.length > 300) _lines.removeAt(0);
-    });
+    if (_disposed) return;
+    _lines.add(s);
+    if (_lines.length > 200) _lines.removeAt(0);
+    _logTick.value++;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scroll.hasClients) {
+      if (!_disposed && _scroll.hasClients) {
         _scroll.jumpTo(_scroll.position.maxScrollExtent);
       }
     });
@@ -69,6 +95,7 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _ticker = createTicker((_) => _grab());
 
     ui.FragmentProgram.fromAsset('shaders/pano.frag')
@@ -80,56 +107,64 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
           _log('Shader load failed: $e');
         });
 
-    _errSub = uvcCamera.streamErrors.listen(
-      (UvcStreamError e) => _log('STREAM ERROR: ${e.message}'),
-    );
+    _errSub = uvcCamera.streamErrors.listen((UvcStreamError e) {
+      _errCount++;
+      _lastErr = e.message;
+    });
     _devSub = uvcCamera.deviceEvents.listen(
       (UvcDeviceEvent e) => _log('USB event: ${e.type}'),
     );
+    _statsTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => _statsTick(),
+    );
   }
 
-  // Frames wider than this are downscaled before the GPU upload.
-  static const int _maxUploadW = 2880;
-  static const int _maxInFlight = 3; // frames decoding/uploading in parallel
-  static const int _grabIntervalMs = 20; // poll the camera at most ~50x/s
+  // Stop all per-frame work while the app is in the background.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (_streaming && !_ticker.isActive) _ticker.start();
+    } else {
+      if (_ticker.isActive) _ticker.stop();
+    }
+  }
 
-  final Stopwatch _clock = Stopwatch()..start();
-  int _lastGrabMs = 0;
-  int _inFlight = 0;
-  int _seqIssued = 0;
-  int _seqShown = 0;
-  int _lastSig = 0;
-  int _grabs = 0; // copies done this second
-  int _srcUnique = 0; // distinct camera frames seen this second
-  int _copyUsAcc = 0;
-  int _decodeUsAcc = 0;
-  int _srcW = 0, _srcH = 0;
+  // ------------------------------------------------------------------
+  // Frame pipeline
+  // ------------------------------------------------------------------
 
-  // Called every vsync while streaming in 360 mode.
+  // Called every vsync while streaming. Does nothing unless it is time to poll.
   void _grab() {
-    if (!_view360) return;
-    _report();
-    if (_inFlight >= _maxInFlight) return;
+    if (!_view360 || _inFlight >= _maxInFlight) return;
     final nowMs = _clock.elapsedMilliseconds;
-    if (nowMs - _lastGrabMs < _grabIntervalMs) return;
-    _lastGrabMs = nowMs;
+    if (nowMs < _nextGrabMs) return;
 
     final sw = Stopwatch()..start();
     final frame = uvcCamera.copyLatestFrame();
-    if (frame == null) return;
+    if (frame == null) {
+      _nextGrabMs = nowMs + 100;
+      return;
+    }
     final bytes = frame.rgbaBytes;
     _copyUsAcc += sw.elapsedMicroseconds;
     _grabs++;
 
-    // Cheap signature from ~2k sampled bytes: if the camera has not produced a
-    // new frame yet, don't decode and upload the same picture again.
+    // Cheap signature of ~2k sampled bytes: skip pictures we already showed.
     int sig = 17;
     final step = ((bytes.length ~/ 2048) & ~3) + 5;
     for (int i = 0; i < bytes.length; i += step) {
       sig = (sig * 31 + bytes[i]) & 0x3fffffff;
     }
-    if (sig == _lastSig) return;
+    if (sig == _lastSig) {
+      // No new frame yet: poll again soon, and back off if it stays quiet.
+      _dupStreak++;
+      _nextGrabMs = _clock.elapsedMilliseconds + (_dupStreak > 3 ? 40 : 12);
+      return;
+    }
+    _dupStreak = 0;
     _lastSig = sig;
+    _nextGrabMs = _clock.elapsedMilliseconds + 10;
     _srcUnique++;
     _srcW = frame.width;
     _srcH = frame.height;
@@ -167,7 +202,7 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
     _inFlight--;
 
     // drop frames that finished out of order or after dispose
-    if (!mounted || seq < _seqShown) {
+    if (_disposed || seq < _seqShown) {
       img.dispose();
       return;
     }
@@ -178,23 +213,31 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
     WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
 
     _decodeUsAcc += sw.elapsedMicroseconds;
-    _frameCount++;
+    _shownCount++;
   }
 
-  // Once a second: "cam" = distinct frames the camera delivered,
-  // "show" = frames actually put on screen.
-  void _report() {
+  // Runs once a second.
+  void _statsTick() {
+    if (_errCount > 0) {
+      _log('STREAM ERROR x$_errCount: $_lastErr');
+      _errCount = 0;
+    }
+    if (!_streaming || !_view360) {
+      if (_fpsText.value.isNotEmpty) _fpsText.value = '';
+      return;
+    }
     final now = DateTime.now();
     final ms = now.difference(_fpsStamp).inMilliseconds;
-    if (ms < 1000) return;
-    final shown = _frameCount;
+    if (ms <= 0) return;
+    final copyMs = _grabs == 0 ? 0.0 : _copyUsAcc / _grabs / 1000;
+    final decMs = _shownCount == 0 ? 0.0 : _decodeUsAcc / _shownCount / 1000;
     _fpsText.value =
         '${_srcW}x$_srcH  '
-        'cam ${(_srcUnique * 1000 / ms).toStringAsFixed(1)} fps  '
-        'show ${(shown * 1000 / ms).toStringAsFixed(1)} fps  '
-        'copy ${_grabs == 0 ? 0 : (_copyUsAcc / _grabs / 1000).toStringAsFixed(1)}ms  '
-        'decode ${shown == 0 ? 0 : (_decodeUsAcc / shown / 1000).toStringAsFixed(1)}ms';
-    _frameCount = 0;
+        'cam ${(_srcUnique * 1000 / ms).toStringAsFixed(1)}  '
+        'show ${(_shownCount * 1000 / ms).toStringAsFixed(1)} fps  '
+        'copy ${copyMs.toStringAsFixed(0)}ms  '
+        'decode ${decMs.toStringAsFixed(0)}ms';
+    _shownCount = 0;
     _srcUnique = 0;
     _grabs = 0;
     _copyUsAcc = 0;
@@ -202,11 +245,15 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
     _fpsStamp = now;
   }
 
+  // ------------------------------------------------------------------
+  // Camera control
+  // ------------------------------------------------------------------
+
   Future<void> _start() async {
     if (_busy || _streaming) return;
     setState(() => _busy = true);
     try {
-      uvcCamera.setLogLevel(UvcLogLevel.debug);
+      if (!kReleaseMode) uvcCamera.setLogLevel(UvcLogLevel.debug);
 
       final camOk = await uvcCamera.ensureCameraPermission();
       _log('CAMERA permission: $camOk');
@@ -271,8 +318,14 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
         (UvcStallEvent e) => _log('STALL event: ${e.type}'),
       );
 
-      _frameCount = 0;
       _fpsStamp = DateTime.now();
+      _shownCount = 0;
+      _srcUnique = 0;
+      _grabs = 0;
+      _copyUsAcc = 0;
+      _decodeUsAcc = 0;
+      _dupStreak = 0;
+      _nextGrabMs = 0;
       if (!_ticker.isActive) _ticker.start();
     } catch (e) {
       _log('ERROR: $e');
@@ -311,24 +364,32 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
 
   @override
   void dispose() {
+    _disposed = true;
+    WidgetsBinding.instance.removeObserver(this);
+    _statsTimer?.cancel();
     _errSub?.cancel();
     _devSub?.cancel();
+    _stop(); // its synchronous part stops the ticker
     _ticker.dispose();
-    _stop();
     _frameImg.value?.dispose();
     _frameImg.dispose();
     _viewTick.dispose();
     _fpsText.dispose();
+    _logTick.dispose();
     _scroll.dispose();
     super.dispose();
   }
+
+  // ------------------------------------------------------------------
+  // UI
+  // ------------------------------------------------------------------
 
   Widget _buildPreview() {
     if (!_streaming) {
       return const Center(child: Text('Press Start'));
     }
 
-    // Flat equirectangular view straight from the GPU texture. No copies.
+    // Flat view straight from the GPU texture. No copies at all.
     if (!_view360) {
       if (_textureId == null) return const SizedBox.shrink();
       return Center(
@@ -356,15 +417,17 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
         }
         _viewTick.value++;
       },
-      child: CustomPaint(
-        size: Size.infinite,
-        painter: PanoPainter(
-          _shader!,
-          _frameImg,
-          () => _yaw,
-          () => _pitch,
-          () => _fov,
-          Listenable.merge([_frameImg, _viewTick]),
+      child: RepaintBoundary(
+        child: CustomPaint(
+          size: Size.infinite,
+          painter: PanoPainter(
+            _shader!,
+            _frameImg,
+            () => _yaw,
+            () => _pitch,
+            () => _fov,
+            Listenable.merge([_frameImg, _viewTick]),
+          ),
         ),
       ),
     );
@@ -418,7 +481,7 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
                   onPressed: _streaming ? _stop : null,
                   child: const Text('Stop'),
                 ),
-                const Text('360'),
+                const Text('360°'),
                 Switch(
                   value: _view360,
                   onChanged: (v) => setState(() => _view360 = v),
@@ -431,15 +494,18 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
               color: const Color(0xFF14171A),
               width: double.infinity,
               child: SelectionArea(
-                child: ListView.builder(
-                  controller: _scroll,
-                  padding: const EdgeInsets.all(8),
-                  itemCount: _lines.length,
-                  itemBuilder: (_, i) => Text(
-                    _lines[i],
-                    style: const TextStyle(
-                      fontSize: 11,
-                      color: Color(0xFFB4C0C3),
+                child: ValueListenableBuilder<int>(
+                  valueListenable: _logTick,
+                  builder: (_, __, ___) => ListView.builder(
+                    controller: _scroll,
+                    padding: const EdgeInsets.all(8),
+                    itemCount: _lines.length,
+                    itemBuilder: (_, i) => Text(
+                      _lines[i],
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Color(0xFFB4C0C3),
+                      ),
                     ),
                   ),
                 ),
@@ -467,6 +533,7 @@ class PanoPainter extends CustomPainter {
   final double Function() yaw;
   final double Function() pitch;
   final double Function() fov;
+  final Paint _paint = Paint();
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -479,7 +546,8 @@ class PanoPainter extends CustomPainter {
       ..setFloat(3, pitch())
       ..setFloat(4, fov())
       ..setImageSampler(0, i);
-    canvas.drawRect(Offset.zero & size, Paint()..shader = shader);
+    _paint.shader = shader;
+    canvas.drawRect(Offset.zero & size, _paint);
   }
 
   @override
