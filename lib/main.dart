@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -31,7 +32,6 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
   int _h = 9;
   bool _busy = false;
   bool _streaming = false;
-  bool _quality = true; // true = try the largest mode first
   bool _view360 = true; // true = shader 360 view, false = flat GPU texture
 
   // Realtime 360 rendering
@@ -40,8 +40,9 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
   ui.FragmentShader? _shader;
   late final Ticker _ticker;
   bool _grabbing = false;
-  double _yaw = 0, _pitch = 0, _fov = 1.6; // radians
-  double _fovAtScaleStart = 1.6;
+  double _yaw = 0, _pitch = 0, _fov = 1.2; // radians
+  double _fovAtScaleStart = 1.2;
+  int _lensMode = 0; // 0 = equirectangular, 1 = dual fisheye
 
   // FPS counter (updates once a second, no per-frame setState)
   final ValueNotifier<String> _fpsText = ValueNotifier('');
@@ -88,39 +89,91 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
     );
   }
 
-  // Called every vsync while streaming in 360 mode. Never queues work.
+  // Frames wider than this are downscaled (on a background thread) before
+  // the GPU upload. Cuts upload size a lot at 2880x1440 with little visible loss.
+  static const int _maxUploadW = 2880;
+
+  int _inFlight = 0; // up to 2 frames decode in parallel
+  int _seqIssued = 0;
+  int _seqShown = 0;
+  int _copyUsAcc = 0;
+  int _decodeUsAcc = 0;
+  int _srcW = 0, _srcH = 0;
+
+  // Called every vsync while streaming in 360 mode.
   void _grab() {
-    if (!_view360 || _grabbing) return;
+    if (!_view360 || _inFlight >= 2) return;
+    final sw = Stopwatch()..start();
     final frame = uvcCamera.copyLatestFrame();
     if (frame == null) return;
-    _grabbing = true;
-    ui.decodeImageFromPixels(
-      frame.rgbaBytes,
-      frame.width,
-      frame.height,
-      ui.PixelFormat.rgba8888,
-      (ui.Image img) {
-        final old = _frameImg.value;
-        if (!mounted) {
-          img.dispose();
-          _grabbing = false;
-          return;
-        }
-        _frameImg.value = img; // only the painter repaints, no setState
-        WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
-        _grabbing = false;
+    final copyUs = sw.elapsedMicroseconds;
+    _inFlight++;
+    _decode(frame.rgbaBytes, frame.width, frame.height, ++_seqIssued, copyUs);
+  }
 
-        _frameCount++;
-        final now = DateTime.now();
-        final ms = now.difference(_fpsStamp).inMilliseconds;
-        if (ms >= 1000) {
-          _fpsText.value =
-              '${frame.width}x${frame.height}  ${(_frameCount * 1000 / ms).toStringAsFixed(1)} fps';
-          _frameCount = 0;
-          _fpsStamp = now;
-        }
-      },
-    );
+  Future<void> _decode(
+    Uint8List bytes,
+    int w,
+    int h,
+    int seq,
+    int copyUs,
+  ) async {
+    final sw = Stopwatch()..start();
+    ui.Image img;
+    try {
+      final buf = await ui.ImmutableBuffer.fromUint8List(bytes);
+      final desc = ui.ImageDescriptor.raw(
+        buf,
+        width: w,
+        height: h,
+        pixelFormat: ui.PixelFormat.rgba8888,
+      );
+      final down = w > _maxUploadW;
+      final codec = await desc.instantiateCodec(
+        targetWidth: down ? _maxUploadW : null,
+        targetHeight: down ? (h * _maxUploadW / w).round() : null,
+      );
+      final fi = await codec.getNextFrame();
+      img = fi.image;
+      codec.dispose();
+      desc.dispose();
+      buf.dispose();
+    } catch (e) {
+      _inFlight--;
+      _log('decode error: $e');
+      return;
+    }
+    _inFlight--;
+
+    // drop frames that finished out of order or after dispose
+    if (!mounted || seq < _seqShown) {
+      img.dispose();
+      return;
+    }
+    _seqShown = seq;
+
+    final old = _frameImg.value;
+    _frameImg.value = img; // only the painter repaints, no setState
+    WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
+
+    _srcW = w;
+    _srcH = h;
+    _copyUsAcc += copyUs;
+    _decodeUsAcc += sw.elapsedMicroseconds;
+    _frameCount++;
+    final now = DateTime.now();
+    final ms = now.difference(_fpsStamp).inMilliseconds;
+    if (ms >= 1000) {
+      final n = _frameCount;
+      _fpsText.value =
+          '${_srcW}x$_srcH  ${(n * 1000 / ms).toStringAsFixed(1)} fps  '
+          'copy ${(_copyUsAcc / n / 1000).toStringAsFixed(1)}ms  '
+          'decode ${(_decodeUsAcc / n / 1000).toStringAsFixed(1)}ms';
+      _frameCount = 0;
+      _copyUsAcc = 0;
+      _decodeUsAcc = 0;
+      _fpsStamp = now;
+    }
   }
 
   Future<void> _start() async {
@@ -154,9 +207,7 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
 
       final tex = await uvcCamera.createPreviewTexture();
       final res = await uvcCamera.startPreviewAuto(
-        preference: _quality
-            ? UvcAutoPreviewPreference.quality
-            : UvcAutoPreviewPreference.reliability,
+        preference: UvcAutoPreviewPreference.quality,
       );
       for (final a in res.attempts) {
         _log(
@@ -270,7 +321,7 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
       onScaleStart: (_) => _fovAtScaleStart = _fov,
       onScaleUpdate: (d) {
         _yaw -= d.focalPointDelta.dx * 0.005 * _fov;
-        _pitch = (_pitch + d.focalPointDelta.dy * 0.005 * _fov).clamp(
+        _pitch = (_pitch - d.focalPointDelta.dy * 0.005 * _fov).clamp(
           -1.5,
           1.5,
         );
@@ -287,6 +338,7 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
           () => _yaw,
           () => _pitch,
           () => _fov,
+          () => _lensMode.toDouble(),
           Listenable.merge([_frameImg, _viewTick]),
         ),
       ),
@@ -346,12 +398,17 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
                   value: _view360,
                   onChanged: (v) => setState(() => _view360 = v),
                 ),
-                const Text('Max quality'),
-                Switch(
-                  value: _quality,
-                  onChanged: _streaming
-                      ? null
-                      : (v) => setState(() => _quality = v),
+                SegmentedButton<int>(
+                  showSelectedIcon: false,
+                  segments: const [
+                    ButtonSegment(value: 0, label: Text('Equirect')),
+                    ButtonSegment(value: 1, label: Text('Fisheye')),
+                  ],
+                  selected: {_lensMode},
+                  onSelectionChanged: (v) {
+                    setState(() => _lensMode = v.first);
+                    _viewTick.value++;
+                  },
                 ),
               ],
             ),
@@ -389,6 +446,7 @@ class PanoPainter extends CustomPainter {
     this.yaw,
     this.pitch,
     this.fov,
+    this.mode,
     Listenable repaint,
   ) : super(repaint: repaint);
 
@@ -397,6 +455,7 @@ class PanoPainter extends CustomPainter {
   final double Function() yaw;
   final double Function() pitch;
   final double Function() fov;
+  final double Function() mode;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -408,6 +467,8 @@ class PanoPainter extends CustomPainter {
       ..setFloat(2, yaw())
       ..setFloat(3, pitch())
       ..setFloat(4, fov())
+      ..setFloat(5, mode())
+      ..setFloat(6, 3.4906585) // 200 deg lens
       ..setImageSampler(0, i);
     canvas.drawRect(Offset.zero & size, Paint()..shader = shader);
   }
