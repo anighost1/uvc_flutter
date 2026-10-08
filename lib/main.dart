@@ -42,7 +42,6 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
   bool _grabbing = false;
   double _yaw = 0, _pitch = 0, _fov = 1.2; // radians
   double _fovAtScaleStart = 1.2;
-  int _lensMode = 0; // 0 = equirectangular, 1 = dual fisheye
 
   // FPS counter (updates once a second, no per-frame setState)
   final ValueNotifier<String> _fpsText = ValueNotifier('');
@@ -89,35 +88,57 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
     );
   }
 
-  // Frames wider than this are downscaled (on a background thread) before
-  // the GPU upload. Cuts upload size a lot at 2880x1440 with little visible loss.
+  // Frames wider than this are downscaled before the GPU upload.
   static const int _maxUploadW = 2880;
+  static const int _maxInFlight = 3; // frames decoding/uploading in parallel
+  static const int _grabIntervalMs = 20; // poll the camera at most ~50x/s
 
-  int _inFlight = 0; // up to 2 frames decode in parallel
+  final Stopwatch _clock = Stopwatch()..start();
+  int _lastGrabMs = 0;
+  int _inFlight = 0;
   int _seqIssued = 0;
   int _seqShown = 0;
+  int _lastSig = 0;
+  int _grabs = 0; // copies done this second
+  int _srcUnique = 0; // distinct camera frames seen this second
   int _copyUsAcc = 0;
   int _decodeUsAcc = 0;
   int _srcW = 0, _srcH = 0;
 
   // Called every vsync while streaming in 360 mode.
   void _grab() {
-    if (!_view360 || _inFlight >= 2) return;
+    if (!_view360) return;
+    _report();
+    if (_inFlight >= _maxInFlight) return;
+    final nowMs = _clock.elapsedMilliseconds;
+    if (nowMs - _lastGrabMs < _grabIntervalMs) return;
+    _lastGrabMs = nowMs;
+
     final sw = Stopwatch()..start();
     final frame = uvcCamera.copyLatestFrame();
     if (frame == null) return;
-    final copyUs = sw.elapsedMicroseconds;
+    final bytes = frame.rgbaBytes;
+    _copyUsAcc += sw.elapsedMicroseconds;
+    _grabs++;
+
+    // Cheap signature from ~2k sampled bytes: if the camera has not produced a
+    // new frame yet, don't decode and upload the same picture again.
+    int sig = 17;
+    final step = ((bytes.length ~/ 2048) & ~3) + 5;
+    for (int i = 0; i < bytes.length; i += step) {
+      sig = (sig * 31 + bytes[i]) & 0x3fffffff;
+    }
+    if (sig == _lastSig) return;
+    _lastSig = sig;
+    _srcUnique++;
+    _srcW = frame.width;
+    _srcH = frame.height;
+
     _inFlight++;
-    _decode(frame.rgbaBytes, frame.width, frame.height, ++_seqIssued, copyUs);
+    _decode(bytes, frame.width, frame.height, ++_seqIssued);
   }
 
-  Future<void> _decode(
-    Uint8List bytes,
-    int w,
-    int h,
-    int seq,
-    int copyUs,
-  ) async {
+  Future<void> _decode(Uint8List bytes, int w, int h, int seq) async {
     final sw = Stopwatch()..start();
     ui.Image img;
     try {
@@ -156,24 +177,29 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
     _frameImg.value = img; // only the painter repaints, no setState
     WidgetsBinding.instance.addPostFrameCallback((_) => old?.dispose());
 
-    _srcW = w;
-    _srcH = h;
-    _copyUsAcc += copyUs;
     _decodeUsAcc += sw.elapsedMicroseconds;
     _frameCount++;
+  }
+
+  // Once a second: "cam" = distinct frames the camera delivered,
+  // "show" = frames actually put on screen.
+  void _report() {
     final now = DateTime.now();
     final ms = now.difference(_fpsStamp).inMilliseconds;
-    if (ms >= 1000) {
-      final n = _frameCount;
-      _fpsText.value =
-          '${_srcW}x$_srcH  ${(n * 1000 / ms).toStringAsFixed(1)} fps  '
-          'copy ${(_copyUsAcc / n / 1000).toStringAsFixed(1)}ms  '
-          'decode ${(_decodeUsAcc / n / 1000).toStringAsFixed(1)}ms';
-      _frameCount = 0;
-      _copyUsAcc = 0;
-      _decodeUsAcc = 0;
-      _fpsStamp = now;
-    }
+    if (ms < 1000) return;
+    final shown = _frameCount;
+    _fpsText.value =
+        '${_srcW}x$_srcH  '
+        'cam ${(_srcUnique * 1000 / ms).toStringAsFixed(1)} fps  '
+        'show ${(shown * 1000 / ms).toStringAsFixed(1)} fps  '
+        'copy ${_grabs == 0 ? 0 : (_copyUsAcc / _grabs / 1000).toStringAsFixed(1)}ms  '
+        'decode ${shown == 0 ? 0 : (_decodeUsAcc / shown / 1000).toStringAsFixed(1)}ms';
+    _frameCount = 0;
+    _srcUnique = 0;
+    _grabs = 0;
+    _copyUsAcc = 0;
+    _decodeUsAcc = 0;
+    _fpsStamp = now;
   }
 
   Future<void> _start() async {
@@ -338,7 +364,6 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
           () => _yaw,
           () => _pitch,
           () => _fov,
-          () => _lensMode.toDouble(),
           Listenable.merge([_frameImg, _viewTick]),
         ),
       ),
@@ -398,18 +423,6 @@ class _X5PageState extends State<X5Page> with SingleTickerProviderStateMixin {
                   value: _view360,
                   onChanged: (v) => setState(() => _view360 = v),
                 ),
-                SegmentedButton<int>(
-                  showSelectedIcon: false,
-                  segments: const [
-                    ButtonSegment(value: 0, label: Text('Equirect')),
-                    ButtonSegment(value: 1, label: Text('Fisheye')),
-                  ],
-                  selected: {_lensMode},
-                  onSelectionChanged: (v) {
-                    setState(() => _lensMode = v.first);
-                    _viewTick.value++;
-                  },
-                ),
               ],
             ),
           ),
@@ -446,7 +459,6 @@ class PanoPainter extends CustomPainter {
     this.yaw,
     this.pitch,
     this.fov,
-    this.mode,
     Listenable repaint,
   ) : super(repaint: repaint);
 
@@ -455,7 +467,6 @@ class PanoPainter extends CustomPainter {
   final double Function() yaw;
   final double Function() pitch;
   final double Function() fov;
-  final double Function() mode;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -467,8 +478,6 @@ class PanoPainter extends CustomPainter {
       ..setFloat(2, yaw())
       ..setFloat(3, pitch())
       ..setFloat(4, fov())
-      ..setFloat(5, mode())
-      ..setFloat(6, 3.4906585) // 200 deg lens
       ..setImageSampler(0, i);
     canvas.drawRect(Offset.zero & size, Paint()..shader = shader);
   }
