@@ -3,20 +3,32 @@ import 'dart:convert';
 import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
 import 'package:socket_io_client/socket_io_client.dart' as io;
 
 // =====================================================================
-// CONFIG (same server and events as the web version)
+// CONFIG
 // =====================================================================
+
+/// One flat "camera" cut out of the 360 frame.
+/// yawDeg: 0 = straight ahead, 90 = right, 180 = behind.
+/// latDeg: 0 = horizon, +90 = straight up, -90 = straight down.
+class ViewSpec {
+  const ViewSpec(this.yawDeg, this.latDeg);
+  final double yawDeg;
+  final double latDeg;
+
+  double get yaw => yawDeg * math.pi / 180;
+  double get pitch => -latDeg * math.pi / 180; // the shader's pitch is "down"
+}
 
 class ApiConfig {
   /// Same server as NEXT_PUBLIC_YOLO_SERVER_URL in the web app.
-  /// On a phone "localhost" is the phone itself, so use your computer's LAN IP.
   /// Override at build time:
-  ///   flutter run --dart-define=YOLO_SERVER_URL=http://192.168.1.20:3000
+  ///   flutter run --dart-define=YOLO_SERVER_URL=http://192.168.1.20:8000
   static const String serverUrl = String.fromEnvironment(
     'YOLO_SERVER_URL',
     defaultValue: 'http://192.168.0.111:8000',
@@ -26,20 +38,41 @@ class ApiConfig {
   static const String resultEvent = 'detection-result';
   static const String errorEvent = 'detection-error';
 
-  /// Width of the frame sent to the server (height keeps the camera's 2:1).
-  static const int sendWidth = 960;
+  // ---- how the 360 frame is cut up for the detector ----
+
+  /// The detector never sees the stretched 360 picture. The sphere is cut into
+  /// normal (perspective) views like a regular camera would see, and each one
+  /// is sent as its own frame. Four views 90 degrees apart cover the horizon.
+  /// Add ViewSpec(0, 90) and ViewSpec(0, -90) for ceiling and floor.
+  /// More views = better coverage, but each cycle takes longer.
+  static const List<ViewSpec> views = [
+    ViewSpec(0, 0),
+    ViewSpec(90, 0),
+    ViewSpec(180, 0),
+    ViewSpec(270, 0),
+  ];
+
+  /// Field of view of each view. Larger than the 90 degree spacing so that
+  /// neighbouring views overlap and objects on a seam are seen whole.
+  static const double viewFovDeg = 110;
+
+  /// Each view is size x size pixels. Keep it at 640 for a YOLO model that
+  /// runs at 640 (the server's mask coordinates then match the image exactly).
+  static const int viewSize = 640;
+
   static const int jpegQuality = 50; // the web version uses 0.5
-  static const int minIntervalMs = 100; // minimum gap between frames sent
+  static const int minIntervalMs = 100; // minimum gap between cycles
   static const Duration timeout = Duration(seconds: 3);
 
   /// Outlines older than this are removed from the screen.
   static const int resultTtlMs = 2000;
   static const double minScore = 0.0;
 
-  /// Douglas-Peucker tolerance in pixels of the sent frame (web uses 1.5).
+  /// Douglas-Peucker tolerance in pixels of a view (web uses 1.5).
   static const double simplifyEpsilonPx = 2.0;
 
-  /// true = no network, returns a fake circle in the middle of the frame.
+  /// true = no network, returns a fake circle in the middle of every view.
+  /// Use it to check that the outlines line up with the preview.
   static const bool useMock = false;
 }
 
@@ -52,9 +85,136 @@ class Detection {
   final String label;
   final double score;
 
-  /// Outline, normalized 0..1 across the full equirectangular frame
-  /// (x = 0 is the left edge, y = 0 is the top).
+  /// Outline. Points are normalized 0..1 inside the image they came from.
+  /// After `mapViewDetection` they are 0..1 across the full 360
+  /// (equirectangular) frame: x = 0 is the left edge, y = 0 is the top.
   final List<Offset> points;
+}
+
+// =====================================================================
+// View rendering (GPU) and coordinate mapping
+// =====================================================================
+
+/// Renders one perspective view out of the full-resolution 360 frame, using
+/// the same shader as the preview. Returns a size x size image.
+Future<ui.Image> renderView(
+  ui.FragmentShader shader,
+  ui.Image frame360,
+  ViewSpec v,
+) async {
+  final size = ApiConfig.viewSize;
+  final s = size.toDouble();
+  shader
+    ..setFloat(0, s)
+    ..setFloat(1, s)
+    ..setFloat(2, v.yaw)
+    ..setFloat(3, v.pitch)
+    ..setFloat(4, ApiConfig.viewFovDeg * math.pi / 180)
+    ..setImageSampler(0, frame360);
+
+  final rec = ui.PictureRecorder();
+  Canvas(rec).drawRect(Rect.fromLTWH(0, 0, s, s), Paint()..shader = shader);
+  final pic = rec.endRecording();
+  try {
+    return await pic.toImage(size, size);
+  } finally {
+    pic.dispose();
+  }
+}
+
+/// A pixel in a rendered view -> (u, v) on the 360 frame. This is the shader's
+/// math run forwards for one pixel.
+Offset viewPixelToUv(
+  double px,
+  double py,
+  double size,
+  double yaw,
+  double pitch,
+  double fov,
+) {
+  final f = 1.0 / math.tan(fov / 2);
+  final nx = (px / size) * 2 - 1;
+  final ny = (py / size) * 2 - 1;
+  var x = nx, y = -ny, z = f;
+  final n = math.sqrt(x * x + y * y + z * z);
+  x /= n;
+  y /= n;
+  z /= n;
+
+  final cp = math.cos(pitch), sp = math.sin(pitch);
+  final y1 = y * cp - z * sp;
+  final z1 = y * sp + z * cp;
+  final cy = math.cos(yaw), sy = math.sin(yaw);
+  final x2 = x * cy + z1 * sy;
+  final z2 = -x * sy + z1 * cy;
+
+  final lon = math.atan2(x2, z2);
+  final lat = math.asin(y1.clamp(-1.0, 1.0).toDouble());
+  return Offset(lon / (2 * math.pi) + 0.5, 0.5 - lat / math.pi);
+}
+
+/// Moves a detection from view coordinates to 360-frame coordinates.
+Detection mapViewDetection(Detection d, ViewSpec v) {
+  final size = ApiConfig.viewSize.toDouble();
+  final fov = ApiConfig.viewFovDeg * math.pi / 180;
+  return Detection(d.label, d.score, [
+    for (final p in d.points)
+      viewPixelToUv(p.dx * size, p.dy * size, size, v.yaw, v.pitch, fov),
+  ]);
+}
+
+List<double> _dirOfUv(Offset uv) {
+  final lon = (uv.dx - 0.5) * 2 * math.pi;
+  final lat = (0.5 - uv.dy) * math.pi;
+  final cl = math.cos(lat);
+  return [cl * math.sin(lon), math.sin(lat), cl * math.cos(lon)];
+}
+
+List<double> _dirOfView(ViewSpec v) {
+  final cp = math.cos(v.pitch);
+  return [cp * math.sin(v.yaw), -math.sin(v.pitch), cp * math.cos(v.yaw)];
+}
+
+List<double> _centroidDir(List<Offset> pts) {
+  double x = 0, y = 0, z = 0;
+  for (final p in pts) {
+    final d = _dirOfUv(p);
+    x += d[0];
+    y += d[1];
+    z += d[2];
+  }
+  final n = math.sqrt(x * x + y * y + z * z);
+  return n == 0 ? [0, 0, 1] : [x / n, y / n, z / n];
+}
+
+/// Combines the detections of all views. Neighbouring views overlap, so the
+/// same object shows up twice. Each object is kept only from the view whose
+/// centre is closest to the object's centre, where distortion is lowest. If
+/// that view did not answer, the other views' result is kept instead.
+/// `perView[i]` holds view i's detections, already in 360-frame coordinates,
+/// or null if that view failed.
+List<Detection> mergeViews(List<List<Detection>?> perView) {
+  final centers = [for (final v in ApiConfig.views) _dirOfView(v)];
+  final out = <Detection>[];
+  for (int i = 0; i < perView.length; i++) {
+    final list = perView[i];
+    if (list == null) continue;
+    for (final d in list) {
+      final c = _centroidDir(d.points);
+      int best = 0;
+      double bestDot = -2;
+      for (int k = 0; k < centers.length; k++) {
+        final dot =
+            c[0] * centers[k][0] + c[1] * centers[k][1] + c[2] * centers[k][2];
+        if (dot > bestDot) {
+          bestDot = dot;
+          best = k;
+        }
+      }
+      if (best == i || perView[best] == null) out.add(d);
+    }
+  }
+  return out;
 }
 
 // =====================================================================
@@ -80,19 +240,28 @@ Future<String> encodeJpegDataUrl(Uint8List rgba, int w, int h) {
 // =====================================================================
 // Socket.IO client
 //   emit   'detect-frame'      { frameId, image: dataUrl }
-//   listen 'detection-result'  { detections: [{label, confidence, bbox, segments}] }
+//   listen 'detection-result'  { frameId, detections: [{label, confidence, bbox, segments}] }
 //   listen 'detection-error'
-// One frame is in flight at a time: the next one is sent after the result.
+// Several frames (one per view) can be waiting at once. Results are matched
+// by frameId, so results meant for other clients are ignored (the server
+// broadcasts every result to everybody).
 // =====================================================================
+
+class _Pending {
+  _Pending(this.completer, this.w, this.h);
+  final Completer<List<Detection>> completer;
+  final int w, h;
+}
 
 class DetectionClient {
   final ValueNotifier<bool> connected = ValueNotifier(false);
   void Function(String message)? onLog;
 
+  /// Makes frame ids unique per app run (the web client also counts from 0).
+  final String tag = 'x5${DateTime.now().millisecondsSinceEpoch % 1000000}';
+
   io.Socket? _socket;
-  Completer<List<Detection>>? _pending;
-  int _sentW = 1, _sentH = 1;
-  int _frameId = 0;
+  final Map<String, _Pending> _pending = {}; // insertion order = send order
   bool _closed = false;
 
   bool get ready => ApiConfig.useMock || connected.value;
@@ -118,42 +287,72 @@ class DetectionClient {
       if (_closed) return;
       connected.value = false;
       onLog?.call('Socket disconnected');
-      _failPending('socket disconnected');
+      _failAll('socket disconnected');
     });
     socket.onConnectError((e) => onLog?.call('Socket connect error: $e'));
 
-    socket.on(ApiConfig.resultEvent, (data) {
-      final p = _pending;
-      if (p == null || p.isCompleted) return; // late result, ignore
-      _pending = null;
+    socket.on(ApiConfig.resultEvent, _onResult);
+    socket.on(ApiConfig.errorEvent, (err) => _failAll('server error: $err'));
+  }
+
+  void _onResult(dynamic data) {
+    dynamic root = data;
+    if (root is String) {
       try {
-        p.complete(parseDetections(data, _sentW, _sentH));
-      } catch (e) {
-        p.completeError(e);
+        root = jsonDecode(root);
+      } catch (_) {
+        return;
       }
-    });
+    }
+    if (root is! Map) return;
 
-    socket.on(
-      ApiConfig.errorEvent,
-      (err) => _failPending('server error: $err'),
-    );
+    _Pending? p;
+    final id = root['frameId']?.toString();
+    if (id != null) {
+      p = _pending.remove(id);
+      if (p == null) return; // not ours
+    } else if (root['success'] == false && _pending.isNotEmpty) {
+      // The worker reports some errors without a frameId. It answers in the
+      // order it received frames, so this belongs to the oldest one.
+      p = _pending.remove(_pending.keys.first);
+    }
+    if (p == null || p.completer.isCompleted) return;
+
+    if (root['success'] == false) {
+      p.completer.completeError('server error: ${root['error']}');
+      return;
+    }
+    try {
+      p.completer.complete(parseDetections(root, p.w, p.h));
+    } catch (e) {
+      p.completer.completeError(e);
+    }
   }
 
-  void _failPending(String message) {
-    final p = _pending;
-    _pending = null;
-    if (p != null && !p.isCompleted) p.completeError(message);
+  void _failAll(String message) {
+    final all = _pending.values.toList();
+    _pending.clear();
+    for (final p in all) {
+      if (!p.completer.isCompleted) p.completer.completeError(message);
+    }
   }
 
-  Future<List<Detection>> detect(String dataUrl, int w, int h) async {
+  /// Sends one frame and waits for its result. The points of the returned
+  /// detections are normalized 0..1 inside this frame.
+  Future<List<Detection>> detect(
+    String frameId,
+    String dataUrl,
+    int w,
+    int h,
+  ) async {
     if (ApiConfig.useMock) {
-      await Future.delayed(const Duration(milliseconds: 80));
+      await Future.delayed(const Duration(milliseconds: 60));
       return [
         Detection('mock', 0.99, [
           for (int i = 0; i < 24; i++)
             Offset(
-              0.5 + 0.06 * math.cos(i * math.pi / 12),
-              0.5 + 0.12 * math.sin(i * math.pi / 12),
+              0.5 + 0.18 * math.cos(i * math.pi / 12),
+              0.5 + 0.18 * math.sin(i * math.pi / 12),
             ),
         ]),
       ];
@@ -163,22 +362,21 @@ class DetectionClient {
     if (socket == null || !connected.value) {
       throw 'server not connected';
     }
-    _sentW = w;
-    _sentH = h;
     final c = Completer<List<Detection>>();
-    _pending = c;
-    socket.emit(ApiConfig.sendEvent, {'frameId': _frameId++, 'image': dataUrl});
+    _pending[frameId] = _Pending(c, w, h);
+    socket.emit(ApiConfig.sendEvent, {'frameId': frameId, 'image': dataUrl});
     return c.future.timeout(
       ApiConfig.timeout,
       onTimeout: () {
-        if (identical(_pending, c)) _pending = null;
-        throw TimeoutException('no response from server');
+        _pending.remove(frameId);
+        throw TimeoutException('no response for $frameId');
       },
     );
   }
 
   void close() {
     _closed = true;
+    _failAll('closed');
     _socket?.dispose();
     _socket = null;
     connected.dispose();

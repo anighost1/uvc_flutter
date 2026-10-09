@@ -76,6 +76,8 @@ class _X5PageState extends State<X5Page>
   // ---- detection API ----
   final DetectionClient _api = DetectionClient();
   final ValueNotifier<List<Detection>> _dets = ValueNotifier(const []);
+  List<ui.FragmentShader> _viewShaders = const []; // one per detection view
+  int _cycleId = 0;
   bool _apiOn = true;
   bool _apiBusy = false;
   int _nextApiMs = 0;
@@ -118,7 +120,12 @@ class _X5PageState extends State<X5Page>
     ui.FragmentProgram.fromAsset('shaders/pano.frag')
         .then((p) {
           if (!mounted) return;
-          setState(() => _shader = p.fragmentShader());
+          setState(() {
+            _shader = p.fragmentShader();
+            _viewShaders = [
+              for (final _ in ApiConfig.views) p.fragmentShader(),
+            ];
+          });
         })
         .catchError((e) {
           _log('Shader load failed: $e');
@@ -193,7 +200,7 @@ class _X5PageState extends State<X5Page>
   Future<void> _decode(Uint8List bytes, int w, int h, int seq) async {
     final sw = Stopwatch()..start();
 
-    // When it is time to ask the API, also make a small copy of this frame.
+    // When it is time to ask the API, the detector also gets this frame.
     final wantApi =
         _apiOn &&
         _api.ready &&
@@ -202,7 +209,6 @@ class _X5PageState extends State<X5Page>
     if (wantApi) _apiBusy = true;
 
     ui.Image img;
-    ui.Image? small;
     try {
       final buf = await ui.ImmutableBuffer.fromUint8List(bytes);
       final desc = ui.ImageDescriptor.raw(
@@ -219,16 +225,6 @@ class _X5PageState extends State<X5Page>
       img = (await codec.getNextFrame()).image;
       codec.dispose();
 
-      if (wantApi) {
-        final sendW = ApiConfig.sendWidth < w ? ApiConfig.sendWidth : w;
-        final sendH = (h * sendW / w).round();
-        final c2 = await desc.instantiateCodec(
-          targetWidth: sendW,
-          targetHeight: sendH,
-        );
-        small = (await c2.getNextFrame()).image;
-        c2.dispose();
-      }
       desc.dispose();
       buf.dispose();
     } catch (e) {
@@ -242,7 +238,6 @@ class _X5PageState extends State<X5Page>
     // drop frames that finished out of order or after dispose
     if (_disposed || seq < _seqShown) {
       img.dispose();
-      small?.dispose();
       if (wantApi) _apiBusy = false;
       return;
     }
@@ -255,29 +250,50 @@ class _X5PageState extends State<X5Page>
     _decodeUsAcc += sw.elapsedMicroseconds;
     _shownCount++;
 
-    if (small != null) unawaited(_detect(small));
+    if (wantApi) unawaited(_detect(img.clone()));
   }
 
-  // Encode the small frame, send it to the API, store the outlines.
-  Future<void> _detect(ui.Image small) async {
+  // One detection cycle: cut the 360 frame into normal perspective views on
+  // the GPU, send each view to the server, map the outlines back onto the 360
+  // frame and merge the overlap between neighbouring views.
+  Future<void> _detect(ui.Image frame360) async {
     final sw = Stopwatch()..start();
     bool failed = false;
+    final cycle = _cycleId++;
+    final views = ApiConfig.views;
     try {
-      final w = small.width, h = small.height;
-      ByteData? bd;
-      try {
-        bd = await small.toByteData(format: ui.ImageByteFormat.rawRgba);
-      } finally {
-        small.dispose();
-      }
-      if (bd == null) throw 'could not read frame pixels';
-      final rgba = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
+      if (_viewShaders.length != views.length) throw 'shader not ready';
 
-      final dataUrl = await encodeJpegDataUrl(rgba, w, h);
-      final result = await _api.detect(dataUrl, w, h);
+      // Render all views first (GPU), then release the frame.
+      final rendered = <ui.Image>[];
+      try {
+        for (int i = 0; i < views.length; i++) {
+          rendered.add(await renderView(_viewShaders[i], frame360, views[i]));
+        }
+      } finally {
+        frame360.dispose();
+      }
+
+      // Send all views at once; the server answers them one after another.
+      final results = await Future.wait([
+        for (int i = 0; i < views.length; i++)
+          _detectView(
+            rendered[i],
+            '${_api.tag}-$cycle-$i',
+          ).then<List<Detection>?>(
+            (list) => [for (final d in list) mapViewDetection(d, views[i])],
+            onError: (e) {
+              _apiErr++;
+              _apiLastErr = '$e';
+              return null;
+            },
+          ),
+      ]);
       if (_disposed) return;
 
-      _dets.value = result;
+      if (results.every((r) => r == null)) throw _apiLastErr;
+
+      _dets.value = mergeViews(results);
       _detAtMs = _clock.elapsedMilliseconds;
       _apiOk++;
       _apiMsAcc += sw.elapsedMilliseconds;
@@ -294,6 +310,20 @@ class _X5PageState extends State<X5Page>
           : ApiConfig.minIntervalMs;
       _nextApiMs = _clock.elapsedMilliseconds + wait;
     }
+  }
+
+  Future<List<Detection>> _detectView(ui.Image view, String frameId) async {
+    final w = view.width, h = view.height;
+    ByteData? bd;
+    try {
+      bd = await view.toByteData(format: ui.ImageByteFormat.rawRgba);
+    } finally {
+      view.dispose();
+    }
+    if (bd == null) throw 'could not read view pixels';
+    final rgba = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
+    final dataUrl = await encodeJpegDataUrl(rgba, w, h);
+    return _api.detect(frameId, dataUrl, w, h);
   }
 
   // Runs once a second.
