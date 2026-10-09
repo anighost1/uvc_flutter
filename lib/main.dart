@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -86,6 +87,14 @@ class _X5PageState extends State<X5Page>
     null,
   );
   final List<int> _viewAtMs = List.filled(ApiConfig.views.length, 0);
+  final List<int> _viewCapMs = List.filled(ApiConfig.views.length, 0);
+  final List<int> _viewSeq = List.filled(ApiConfig.views.length, -1);
+  bool _scan360 = false; // false = detect only where you are looking
+  double _aspect = 1.4; // preview box width / height
+  int _renderMsAcc = 0, _encMsAcc = 0, _netMsAcc = 0;
+
+  int get _inFlightLimit =>
+      _scan360 ? ApiConfig.inFlightLimit : ApiConfig.followInFlight;
   int _nextApiMs = 0;
   int _detAtMs = 0;
   int _apiFailStreak = 0;
@@ -210,7 +219,7 @@ class _X5PageState extends State<X5Page>
     final wantApi =
         _apiOn &&
         _api.ready &&
-        _apiInFlight < ApiConfig.inFlightLimit &&
+        _apiInFlight < _inFlightLimit &&
         _clock.elapsedMilliseconds >= _nextApiMs;
     if (wantApi) _apiInFlight++;
 
@@ -259,33 +268,60 @@ class _X5PageState extends State<X5Page>
     if (wantApi) unawaited(_detect(img.clone()));
   }
 
-  // Rolling detection. Each call handles ONE view: render it from the frame,
-  // send it, and put its outlines on screen the moment its answer arrives.
-  // Views take turns and up to ApiConfig.inFlightLimit are out at the server
-  // at once, so the server never sits idle and the outlines refresh view by
-  // view instead of waiting for a whole round of all views.
+  // Rolling detection. Each call handles ONE request: render a view from the
+  // frame, send it, and put its outlines on screen the moment the answer
+  // arrives.
+  //   follow mode (default): the view is the one you are looking at right now
+  //   scan mode: the fixed views of ApiConfig.views take turns
   Future<void> _detect(ui.Image frame360) async {
     final sw = Stopwatch()..start();
     bool failed = false;
-    final views = ApiConfig.views;
-    final vi = _viewCursor++ % views.length;
-    final frameId = '${_api.tag}-${_cycleId++}-$vi';
+    final scan = _scan360;
+    final capMs = _clock.elapsedMilliseconds; // this frame is on screen now
+    final seq = _cycleId++;
+    final cursor = _viewCursor++;
+    final nShaders = _viewShaders.length;
+    int slot;
+    int shaderIdx;
+    ViewSpec spec;
+    if (scan) {
+      slot = cursor % ApiConfig.views.length;
+      shaderIdx = slot;
+      spec = ApiConfig.views[slot];
+    } else {
+      slot = 0;
+      shaderIdx = nShaders == 0 ? 0 : cursor % nShaders;
+      spec = ViewSpec.fromAngles(_yaw, _pitch, _followFov());
+    }
+    final frameId = '${_api.tag}-$seq-$slot';
     try {
       ui.Image view;
       try {
-        if (_viewShaders.length != views.length) throw 'shader not ready';
-        view = await renderView(_viewShaders[vi], frame360, views[vi]);
+        if (nShaders != ApiConfig.views.length) throw 'shader not ready';
+        view = await renderView(_viewShaders[shaderIdx], frame360, spec);
       } finally {
         frame360.dispose();
       }
-      final list = await _detectView(view, frameId);
-      if (_disposed) return;
+      final renderMs = sw.elapsedMilliseconds;
+      final (list, encMs, netMs) = await _detectView(view, frameId);
+      if (_disposed || scan != _scan360) return;
 
-      _viewDets[vi] = [for (final d in list) mapViewDetection(d, views[vi])];
-      _viewAtMs[vi] = _clock.elapsedMilliseconds;
-      _publishDets();
+      // an older answer that arrives after a newer one is thrown away
+      if (seq > _viewSeq[slot]) {
+        _viewSeq[slot] = seq;
+        final mapped = addMotion(_viewDets[slot], _viewCapMs[slot], [
+          for (final d in list) mapViewDetection(d, spec),
+        ], capMs);
+        _viewDets[slot] = mapped;
+        _viewAtMs[slot] = _clock.elapsedMilliseconds;
+        _viewCapMs[slot] = capMs;
+        _publishDets();
+      }
       _apiOk++;
       _apiMsAcc += sw.elapsedMilliseconds;
+      _renderMsAcc += renderMs;
+      _encMsAcc += encMs;
+      _netMsAcc += netMs;
       _apiFailStreak = 0;
     } catch (e) {
       failed = true;
@@ -301,7 +337,13 @@ class _X5PageState extends State<X5Page>
     }
   }
 
-  // Merge the latest answer of every view (ignoring stale ones) and show it.
+  // A square view that covers what is on screen (with a small margin).
+  double _followFov() {
+    final half = math.atan(_aspect * math.tan(_fov / 2));
+    return (2 * half * 1.1).clamp(0.8, 2.0).toDouble();
+  }
+
+  // Show the latest answers (ignoring stale views).
   void _publishDets() {
     final now = _clock.elapsedMilliseconds;
     final fresh = <List<Detection>?>[
@@ -310,18 +352,27 @@ class _X5PageState extends State<X5Page>
             ? _viewDets[i]
             : null,
     ];
-    _dets.value = mergeViews(fresh);
+    _dets.value = _scan360
+        ? mergeViews(fresh)
+        : (fresh[0] ?? const <Detection>[]);
     _detAtMs = now;
   }
 
   void _clearDets() {
     for (int i = 0; i < _viewDets.length; i++) {
       _viewDets[i] = null;
+      _viewCapMs[i] = 0;
     }
     _dets.value = const [];
   }
 
-  Future<List<Detection>> _detectView(ui.Image view, String frameId) async {
+  // Returns the detections, the time spent reading + encoding the view, and
+  // the time spent waiting for the server.
+  Future<(List<Detection>, int, int)> _detectView(
+    ui.Image view,
+    String frameId,
+  ) async {
+    final sw = Stopwatch()..start();
     final w = view.width, h = view.height;
     ByteData? bd;
     try {
@@ -332,7 +383,9 @@ class _X5PageState extends State<X5Page>
     if (bd == null) throw 'could not read view pixels';
     final rgba = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
     final dataUrl = await encodeJpegDataUrl(rgba, w, h);
-    return _api.detect(frameId, dataUrl, w, h);
+    final encMs = sw.elapsedMilliseconds;
+    final list = await _api.detect(frameId, dataUrl, w, h);
+    return (list, encMs, sw.elapsedMilliseconds - encMs);
   }
 
   // Runs once a second.
@@ -366,13 +419,19 @@ class _X5PageState extends State<X5Page>
     final copyMs = _grabs == 0 ? 0.0 : _copyUsAcc / _grabs / 1000;
     final decMs = _shownCount == 0 ? 0.0 : _decodeUsAcc / _shownCount / 1000;
     final apiMs = _apiOk == 0 ? 0 : (_apiMsAcc / _apiOk).round();
+    String avg(int acc) =>
+        _apiOk == 0 ? '0' : (acc / _apiOk).toStringAsFixed(0);
+    final apiLines = !_apiOn
+        ? ''
+        : '\napi ${(_apiOk * 1000 / ms).toStringAsFixed(1)}/s ${apiMs}ms  ${_dets.value.length} objects'
+              '\nrender ${avg(_renderMsAcc)}  read+jpeg ${avg(_encMsAcc)}  server ${avg(_netMsAcc)} ms';
     _fpsText.value =
         '${_srcW}x$_srcH  '
         'cam ${(_srcUnique * 1000 / ms).toStringAsFixed(1)}  '
         'show ${(_shownCount * 1000 / ms).toStringAsFixed(1)} fps  '
         'copy ${copyMs.toStringAsFixed(0)}ms  '
         'decode ${decMs.toStringAsFixed(0)}ms'
-        '${_apiOn ? '\napi ${(_apiOk * 1000 / ms).toStringAsFixed(1)} views/s ${apiMs}ms  ${_dets.value.length} objects' : ''}';
+        '$apiLines';
     _shownCount = 0;
     _srcUnique = 0;
     _grabs = 0;
@@ -380,6 +439,9 @@ class _X5PageState extends State<X5Page>
     _decodeUsAcc = 0;
     _apiOk = 0;
     _apiMsAcc = 0;
+    _renderMsAcc = 0;
+    _encMsAcc = 0;
+    _netMsAcc = 0;
     _fpsStamp = now;
   }
 
@@ -548,51 +610,57 @@ class _X5PageState extends State<X5Page>
     if (_shader == null) {
       return const Center(child: Text('Loading shader'));
     }
-    return GestureDetector(
-      onScaleStart: (_) => _fovAtScaleStart = _fov,
-      onScaleUpdate: (d) {
-        _yaw -= d.focalPointDelta.dx * 0.005 * _fov;
-        _pitch = (_pitch - d.focalPointDelta.dy * 0.005 * _fov).clamp(
-          -1.5,
-          1.5,
-        );
-        if (d.scale != 1.0) {
-          _fov = (_fovAtScaleStart / d.scale).clamp(0.5, 2.2);
-        }
-        _viewTick.value++;
-      },
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          RepaintBoundary(
-            child: CustomPaint(
-              size: Size.infinite,
-              painter: PanoPainter(
-                _shader!,
-                _frameImg,
-                () => _yaw,
-                () => _pitch,
-                () => _fov,
-                Listenable.merge([_frameImg, _viewTick]),
-              ),
-            ),
-          ),
-          IgnorePointer(
-            child: RepaintBoundary(
-              child: CustomPaint(
-                size: Size.infinite,
-                painter: OutlinePainter(
-                  _dets,
-                  () => _yaw,
-                  () => _pitch,
-                  () => _fov,
-                  Listenable.merge([_dets, _viewTick]),
+    return LayoutBuilder(
+      builder: (context, box) {
+        _aspect = box.maxWidth / box.maxHeight;
+        return GestureDetector(
+          onScaleStart: (_) => _fovAtScaleStart = _fov,
+          onScaleUpdate: (d) {
+            _yaw -= d.focalPointDelta.dx * 0.005 * _fov;
+            _pitch = (_pitch - d.focalPointDelta.dy * 0.005 * _fov).clamp(
+              -1.5,
+              1.5,
+            );
+            if (d.scale != 1.0) {
+              _fov = (_fovAtScaleStart / d.scale).clamp(0.5, 2.2);
+            }
+            _viewTick.value++;
+          },
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              RepaintBoundary(
+                child: CustomPaint(
+                  size: Size.infinite,
+                  painter: PanoPainter(
+                    _shader!,
+                    _frameImg,
+                    () => _yaw,
+                    () => _pitch,
+                    () => _fov,
+                    Listenable.merge([_frameImg, _viewTick]),
+                  ),
                 ),
               ),
-            ),
+              IgnorePointer(
+                child: RepaintBoundary(
+                  child: CustomPaint(
+                    size: Size.infinite,
+                    painter: OutlinePainter(
+                      _dets,
+                      () => _yaw,
+                      () => _pitch,
+                      () => _fov,
+                      () => _clock.elapsedMilliseconds,
+                      Listenable.merge([_dets, _viewTick, _frameImg]),
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ),
-        ],
-      ),
+        );
+      },
     );
   }
 
@@ -648,6 +716,14 @@ class _X5PageState extends State<X5Page>
                 Switch(
                   value: _view360,
                   onChanged: (v) => setState(() => _view360 = v),
+                ),
+                const Text('Scan 360'),
+                Switch(
+                  value: _scan360,
+                  onChanged: (v) {
+                    setState(() => _scan360 = v);
+                    _clearDets();
+                  },
                 ),
                 const Text('Detect'),
                 Switch(

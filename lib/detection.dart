@@ -17,9 +17,24 @@ import 'package:socket_io_client/socket_io_client.dart' as io;
 /// yawDeg: 0 = straight ahead, 90 = right, 180 = behind.
 /// latDeg: 0 = horizon, +90 = straight up, -90 = straight down.
 class ViewSpec {
-  const ViewSpec(this.yawDeg, this.latDeg);
+  const ViewSpec(
+    this.yawDeg,
+    this.latDeg, {
+    this.fovDeg = ApiConfig.viewFovDeg,
+  });
+
+  /// A view that looks exactly where the preview is looking (angles in the
+  /// preview's own units: radians, pitch positive = looking down).
+  factory ViewSpec.fromAngles(double yaw, double pitch, double fov) => ViewSpec(
+    yaw * 180 / math.pi,
+    -pitch * 180 / math.pi,
+    fovDeg: fov * 180 / math.pi,
+  );
+
   final double yawDeg;
   final double latDeg;
+  final double fovDeg;
+  double get fov => fovDeg * math.pi / 180;
 
   double get yaw => yawDeg * math.pi / 180;
   double get pitch => -latDeg * math.pi / 180; // the shader's pitch is "down"
@@ -72,10 +87,27 @@ class ApiConfig {
 
   /// Background isolates that encode views to JPEG.
   static const int encoderIsolates = 2;
+
+  /// In "follow" mode (the default) only the part you are looking at is
+  /// sent. One request at a time keeps the answer as fresh as possible: a
+  /// second request would just wait in the server's queue.
+  static const int followInFlight = 1;
+
+  // ---- hiding the delay: moving outlines are predicted forward ----
+
+  /// An outline is moved along its measured speed for at most this long.
+  static const int maxExtrapolateMs = 400;
+
+  /// A new outline is matched to the same label in the previous answer if it
+  /// is closer than this (degrees on the sphere).
+  static const double matchMaxDeg = 15;
+
+  /// Movement smaller than this (degrees) is treated as noise, not motion.
+  static const double motionDeadDeg = 1.0;
   static const Duration timeout = Duration(seconds: 3);
 
   /// Outlines older than this are removed from the screen.
-  static const int resultTtlMs = 2000;
+  static const int resultTtlMs = 1200;
   static const double minScore = 0.0;
 
   /// Douglas-Peucker tolerance in pixels of a view (web uses 1.5).
@@ -91,9 +123,24 @@ class ApiConfig {
 // =====================================================================
 
 class Detection {
-  const Detection(this.label, this.score, this.points);
+  const Detection(
+    this.label,
+    this.score,
+    this.points, {
+    this.capMs = 0,
+    this.vel = Offset.zero,
+  });
   final String label;
   final double score;
+
+  /// When the frame this was detected on was on screen (app clock, ms).
+  final int capMs;
+
+  /// Measured speed of the outline on the 360 frame, in (u, v) per ms.
+  final Offset vel;
+
+  Detection withMotion(int capMs, Offset vel) =>
+      Detection(label, score, points, capMs: capMs, vel: vel);
 
   /// Outline. Points are normalized 0..1 inside the image they came from.
   /// After `mapViewDetection` they are 0..1 across the full 360
@@ -119,7 +166,7 @@ Future<ui.Image> renderView(
     ..setFloat(1, s)
     ..setFloat(2, v.yaw)
     ..setFloat(3, v.pitch)
-    ..setFloat(4, ApiConfig.viewFovDeg * math.pi / 180)
+    ..setFloat(4, v.fov)
     ..setImageSampler(0, frame360);
 
   final rec = ui.PictureRecorder();
@@ -166,7 +213,7 @@ Offset viewPixelToUv(
 /// Moves a detection from view coordinates to 360-frame coordinates.
 Detection mapViewDetection(Detection d, ViewSpec v) {
   final size = ApiConfig.viewSize.toDouble();
-  final fov = ApiConfig.viewFovDeg * math.pi / 180;
+  final fov = v.fov;
   return Detection(d.label, d.score, [
     for (final p in d.points)
       viewPixelToUv(p.dx * size, p.dy * size, size, v.yaw, v.pitch, fov),
@@ -223,6 +270,86 @@ List<Detection> mergeViews(List<List<Detection>?> perView) {
       }
       if (best == i || perView[best] == null) out.add(d);
     }
+  }
+  return out;
+}
+
+// =====================================================================
+// Motion: how fast does each outline move?
+//
+// An answer is always a little old by the time it is drawn. Each new outline
+// is matched to the same object in the previous answer of that view, its
+// speed is measured, and the painter moves the outline forward by the time
+// that has passed since the frame it was detected on.
+// =====================================================================
+
+double _wrapU(double dx) => dx - (dx + 0.5).floorToDouble();
+
+Offset _centroidUv(List<Offset> pts) {
+  final r = pts.first.dx;
+  double sx = 0, sy = 0;
+  for (final p in pts) {
+    sx += _wrapU(p.dx - r);
+    sy += p.dy;
+  }
+  return Offset(r + sx / pts.length, sy / pts.length);
+}
+
+double _angDeg(Offset a, Offset b) {
+  final lat = (0.5 - a.dy) * math.pi;
+  final dx = _wrapU(a.dx - b.dx) * 360 * math.cos(lat);
+  final dy = (a.dy - b.dy) * 180;
+  return math.sqrt(dx * dx + dy * dy);
+}
+
+List<Detection> addMotion(
+  List<Detection>? prev,
+  int prevCapMs,
+  List<Detection> cur,
+  int curCapMs,
+) {
+  final p = prev ?? const <Detection>[];
+  final dt = curCapMs - prevCapMs;
+  final canMatch = p.isNotEmpty && dt > 30 && dt <= 1000;
+  final prevC = canMatch
+      ? [for (final x in p) _centroidUv(x.points)]
+      : const <Offset>[];
+  final used = <int>{};
+  final out = <Detection>[];
+
+  for (final d in cur) {
+    if (!canMatch) {
+      out.add(d.withMotion(curCapMs, Offset.zero));
+      continue;
+    }
+    final c = _centroidUv(d.points);
+    int best = -1;
+    double bestDeg = ApiConfig.matchMaxDeg;
+    for (int i = 0; i < p.length; i++) {
+      if (used.contains(i) || p[i].label != d.label) continue;
+      final deg = _angDeg(c, prevC[i]);
+      if (deg < bestDeg) {
+        bestDeg = deg;
+        best = i;
+      }
+    }
+    if (best < 0 || bestDeg < ApiConfig.motionDeadDeg) {
+      if (best >= 0) used.add(best);
+      out.add(d.withMotion(curCapMs, Offset.zero)); // new or standing still
+      continue;
+    }
+    used.add(best);
+    final raw = Offset(
+      _wrapU(c.dx - prevC[best].dx) / dt,
+      (c.dy - prevC[best].dy) / dt,
+    );
+    final pv = p[best].vel;
+    out.add(
+      d.withMotion(
+        curCapMs,
+        Offset(raw.dx * 0.6 + pv.dx * 0.4, raw.dy * 0.6 + pv.dy * 0.4),
+      ),
+    );
   }
   return out;
 }
@@ -618,13 +745,20 @@ double _distToLine(Offset p, Offset a, Offset b) {
 // =====================================================================
 
 class OutlinePainter extends CustomPainter {
-  OutlinePainter(this.dets, this.yaw, this.pitch, this.fov, Listenable repaint)
-    : super(repaint: repaint);
+  OutlinePainter(
+    this.dets,
+    this.yaw,
+    this.pitch,
+    this.fov,
+    this.nowMs,
+    Listenable repaint,
+  ) : super(repaint: repaint);
 
   final ValueNotifier<List<Detection>> dets;
   final double Function() yaw;
   final double Function() pitch;
   final double Function() fov;
+  final int Function() nowMs;
 
   final Paint _stroke = Paint()
     ..style = PaintingStyle.stroke
@@ -719,8 +853,14 @@ class OutlinePainter extends CustomPainter {
       bool pen = false;
       bool allVisible = true;
       Offset? labelAt;
-      for (final uv in d.points) {
-        final s = project(uv);
+      final dtMs = (nowMs() - d.capMs)
+          .clamp(0, ApiConfig.maxExtrapolateMs)
+          .toDouble();
+      final ox = d.vel.dx * dtMs, oy = d.vel.dy * dtMs;
+      for (final uv0 in d.points) {
+        final s = project(
+          Offset(uv0.dx + ox, (uv0.dy + oy).clamp(0.0, 1.0).toDouble()),
+        );
         if (s == null) {
           pen = false;
           allVisible = false;
