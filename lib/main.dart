@@ -79,7 +79,13 @@ class _X5PageState extends State<X5Page>
   List<ui.FragmentShader> _viewShaders = const []; // one per detection view
   int _cycleId = 0;
   bool _apiOn = true;
-  bool _apiBusy = false;
+  int _apiInFlight = 0; // views currently out at the server
+  int _viewCursor = 0; // which view is sent next
+  final List<List<Detection>?> _viewDets = List.filled(
+    ApiConfig.views.length,
+    null,
+  );
+  final List<int> _viewAtMs = List.filled(ApiConfig.views.length, 0);
   int _nextApiMs = 0;
   int _detAtMs = 0;
   int _apiFailStreak = 0;
@@ -204,9 +210,9 @@ class _X5PageState extends State<X5Page>
     final wantApi =
         _apiOn &&
         _api.ready &&
-        !_apiBusy &&
+        _apiInFlight < ApiConfig.inFlightLimit &&
         _clock.elapsedMilliseconds >= _nextApiMs;
-    if (wantApi) _apiBusy = true;
+    if (wantApi) _apiInFlight++;
 
     ui.Image img;
     try {
@@ -229,7 +235,7 @@ class _X5PageState extends State<X5Page>
       buf.dispose();
     } catch (e) {
       _inFlight--;
-      if (wantApi) _apiBusy = false;
+      if (wantApi) _apiInFlight--;
       _log('decode error: $e');
       return;
     }
@@ -238,7 +244,7 @@ class _X5PageState extends State<X5Page>
     // drop frames that finished out of order or after dispose
     if (_disposed || seq < _seqShown) {
       img.dispose();
-      if (wantApi) _apiBusy = false;
+      if (wantApi) _apiInFlight--;
       return;
     }
     _seqShown = seq;
@@ -253,48 +259,31 @@ class _X5PageState extends State<X5Page>
     if (wantApi) unawaited(_detect(img.clone()));
   }
 
-  // One detection cycle: cut the 360 frame into normal perspective views on
-  // the GPU, send each view to the server, map the outlines back onto the 360
-  // frame and merge the overlap between neighbouring views.
+  // Rolling detection. Each call handles ONE view: render it from the frame,
+  // send it, and put its outlines on screen the moment its answer arrives.
+  // Views take turns and up to ApiConfig.inFlightLimit are out at the server
+  // at once, so the server never sits idle and the outlines refresh view by
+  // view instead of waiting for a whole round of all views.
   Future<void> _detect(ui.Image frame360) async {
     final sw = Stopwatch()..start();
     bool failed = false;
-    final cycle = _cycleId++;
     final views = ApiConfig.views;
+    final vi = _viewCursor++ % views.length;
+    final frameId = '${_api.tag}-${_cycleId++}-$vi';
     try {
-      if (_viewShaders.length != views.length) throw 'shader not ready';
-
-      // Render all views first (GPU), then release the frame.
-      final rendered = <ui.Image>[];
+      ui.Image view;
       try {
-        for (int i = 0; i < views.length; i++) {
-          rendered.add(await renderView(_viewShaders[i], frame360, views[i]));
-        }
+        if (_viewShaders.length != views.length) throw 'shader not ready';
+        view = await renderView(_viewShaders[vi], frame360, views[vi]);
       } finally {
         frame360.dispose();
       }
-
-      // Send all views at once; the server answers them one after another.
-      final results = await Future.wait([
-        for (int i = 0; i < views.length; i++)
-          _detectView(
-            rendered[i],
-            '${_api.tag}-$cycle-$i',
-          ).then<List<Detection>?>(
-            (list) => [for (final d in list) mapViewDetection(d, views[i])],
-            onError: (e) {
-              _apiErr++;
-              _apiLastErr = '$e';
-              return null;
-            },
-          ),
-      ]);
+      final list = await _detectView(view, frameId);
       if (_disposed) return;
 
-      if (results.every((r) => r == null)) throw _apiLastErr;
-
-      _dets.value = mergeViews(results);
-      _detAtMs = _clock.elapsedMilliseconds;
+      _viewDets[vi] = [for (final d in list) mapViewDetection(d, views[vi])];
+      _viewAtMs[vi] = _clock.elapsedMilliseconds;
+      _publishDets();
       _apiOk++;
       _apiMsAcc += sw.elapsedMilliseconds;
       _apiFailStreak = 0;
@@ -304,12 +293,32 @@ class _X5PageState extends State<X5Page>
       _apiLastErr = '$e';
       _apiFailStreak++;
     } finally {
-      _apiBusy = false;
+      _apiInFlight--;
       final wait = failed
           ? (250 * _apiFailStreak).clamp(250, 2000).toInt()
           : ApiConfig.minIntervalMs;
       _nextApiMs = _clock.elapsedMilliseconds + wait;
     }
+  }
+
+  // Merge the latest answer of every view (ignoring stale ones) and show it.
+  void _publishDets() {
+    final now = _clock.elapsedMilliseconds;
+    final fresh = <List<Detection>?>[
+      for (int i = 0; i < _viewDets.length; i++)
+        (_viewDets[i] != null && now - _viewAtMs[i] <= ApiConfig.resultTtlMs)
+            ? _viewDets[i]
+            : null,
+    ];
+    _dets.value = mergeViews(fresh);
+    _detAtMs = now;
+  }
+
+  void _clearDets() {
+    for (int i = 0; i < _viewDets.length; i++) {
+      _viewDets[i] = null;
+    }
+    _dets.value = const [];
   }
 
   Future<List<Detection>> _detectView(ui.Image view, String frameId) async {
@@ -336,11 +345,17 @@ class _X5PageState extends State<X5Page>
       _log('API ERROR x$_apiErr: $_apiLastErr');
       _apiErr = 0;
     }
-    // remove outlines that have not been refreshed
-    if (_dets.value.isNotEmpty &&
-        _clock.elapsedMilliseconds - _detAtMs > ApiConfig.resultTtlMs) {
-      _dets.value = const [];
+    // remove outlines of views that have not been refreshed
+    final nowMs = _clock.elapsedMilliseconds;
+    bool expired = false;
+    for (int i = 0; i < _viewDets.length; i++) {
+      if (_viewDets[i] != null &&
+          nowMs - _viewAtMs[i] > ApiConfig.resultTtlMs) {
+        _viewDets[i] = null;
+        expired = true;
+      }
     }
+    if (expired) _publishDets();
     if (!_streaming || !_view360) {
       if (_fpsText.value.isNotEmpty) _fpsText.value = '';
       return;
@@ -357,7 +372,7 @@ class _X5PageState extends State<X5Page>
         'show ${(_shownCount * 1000 / ms).toStringAsFixed(1)} fps  '
         'copy ${copyMs.toStringAsFixed(0)}ms  '
         'decode ${decMs.toStringAsFixed(0)}ms'
-        '${_apiOn ? '\napi ${(_apiOk * 1000 / ms).toStringAsFixed(1)}/s ${apiMs}ms  ${_dets.value.length} objects' : ''}';
+        '${_apiOn ? '\napi ${(_apiOk * 1000 / ms).toStringAsFixed(1)} views/s ${apiMs}ms  ${_dets.value.length} objects' : ''}';
     _shownCount = 0;
     _srcUnique = 0;
     _grabs = 0;
@@ -461,7 +476,7 @@ class _X5PageState extends State<X5Page>
 
   Future<void> _stop() async {
     if (_ticker.isActive) _ticker.stop();
-    if (!_disposed) _dets.value = const [];
+    if (!_disposed) _clearDets();
     await _stallSub?.cancel();
     _stallSub = null;
     try {
@@ -501,6 +516,7 @@ class _X5PageState extends State<X5Page>
     _frameImg.dispose();
     _viewTick.dispose();
     _api.close();
+    disposeJpegPool();
     _dets.dispose();
     _fpsText.dispose();
     _logTick.dispose();
@@ -638,7 +654,7 @@ class _X5PageState extends State<X5Page>
                   value: _apiOn,
                   onChanged: (v) {
                     setState(() => _apiOn = v);
-                    if (!v) _dets.value = const [];
+                    if (!v) _clearDets();
                   },
                 ),
                 ValueListenableBuilder<bool>(

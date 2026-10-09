@@ -61,7 +61,17 @@ class ApiConfig {
   static const int viewSize = 640;
 
   static const int jpegQuality = 50; // the web version uses 0.5
-  static const int minIntervalMs = 100; // minimum gap between cycles
+  static const int minIntervalMs = 0; // minimum gap between requests
+
+  /// How many views are out at the server at the same time. 2 keeps the
+  /// server busy while the next view is being rendered and encoded. The
+  /// server handles frames one by one, so more than 2-3 only adds waiting.
+  static const int maxInFlight = 2;
+  static int get inFlightLimit =>
+      maxInFlight < views.length ? maxInFlight : views.length;
+
+  /// Background isolates that encode views to JPEG.
+  static const int encoderIsolates = 2;
   static const Duration timeout = Duration(seconds: 3);
 
   /// Outlines older than this are removed from the screen.
@@ -222,20 +232,88 @@ List<Detection> mergeViews(List<List<Detection>?> perView) {
 // Same payload the web version sends in `image`.
 // =====================================================================
 
-Future<String> encodeJpegDataUrl(Uint8List rgba, int w, int h) {
-  final quality = ApiConfig.jpegQuality;
-  return Isolate.run<String>(() {
-    final im = img.Image.fromBytes(
-      width: w,
-      height: h,
-      bytes: rgba.buffer,
-      bytesOffset: rgba.offsetInBytes,
-      numChannels: 4,
-    );
-    final jpg = img.encodeJpg(im, quality: quality);
-    return 'data:image/jpeg;base64,${base64Encode(jpg)}';
+class _JpegJob {
+  _JpegJob(this.data, this.w, this.h, this.quality, this.reply);
+  final TransferableTypedData data;
+  final int w, h, quality;
+  final SendPort reply;
+}
+
+void _jpegWorkerMain(SendPort ready) {
+  final port = ReceivePort();
+  ready.send(port.sendPort);
+  port.listen((msg) {
+    final job = msg as _JpegJob;
+    try {
+      final bytes = job.data.materialize().asUint8List();
+      final im = img.Image.fromBytes(
+        width: job.w,
+        height: job.h,
+        bytes: bytes.buffer,
+        bytesOffset: bytes.offsetInBytes,
+        numChannels: 4,
+      );
+      final jpg = img.encodeJpg(im, quality: job.quality);
+      job.reply.send(['ok', 'data:image/jpeg;base64,${base64Encode(jpg)}']);
+    } catch (e) {
+      job.reply.send(['err', '$e']);
+    }
   });
 }
+
+/// Encoder isolates are started once and reused. Spawning a new isolate for
+/// every frame (Isolate.run) costs several milliseconds each time, and the
+/// pixels are handed over without copying.
+class _JpegPool {
+  final List<SendPort> _ports = [];
+  final List<Isolate> _isolates = [];
+  Future<void>? _starting;
+  int _next = 0;
+
+  Future<void> _start() async {
+    for (int i = 0; i < ApiConfig.encoderIsolates; i++) {
+      final ready = ReceivePort();
+      _isolates.add(await Isolate.spawn(_jpegWorkerMain, ready.sendPort));
+      _ports.add(await ready.first as SendPort);
+      ready.close();
+    }
+  }
+
+  Future<String> encode(Uint8List rgba, int w, int h) async {
+    await (_starting ??= _start());
+    final port = _ports[_next++ % _ports.length];
+    final reply = ReceivePort();
+    port.send(
+      _JpegJob(
+        TransferableTypedData.fromList([rgba]),
+        w,
+        h,
+        ApiConfig.jpegQuality,
+        reply.sendPort,
+      ),
+    );
+    final res = await reply.first as List;
+    reply.close();
+    if (res[0] != 'ok') throw 'jpeg encode failed: ${res[1]}';
+    return res[1] as String;
+  }
+
+  void dispose() {
+    for (final i in _isolates) {
+      i.kill(priority: Isolate.immediate);
+    }
+    _isolates.clear();
+    _ports.clear();
+    _starting = null;
+  }
+}
+
+final _JpegPool _jpegPool = _JpegPool();
+
+Future<String> encodeJpegDataUrl(Uint8List rgba, int w, int h) =>
+    _jpegPool.encode(rgba, w, h);
+
+void disposeJpegPool() => _jpegPool.dispose();
 
 // =====================================================================
 // Socket.IO client
@@ -555,6 +633,43 @@ class OutlinePainter extends CustomPainter {
   final Paint _fill = Paint()..style = PaintingStyle.fill;
   final Paint _labelBg = Paint();
 
+  // Label layout is expensive and only changes when the detections change,
+  // so it is done once per result list instead of on every repaint.
+  List<Detection>? _cachedFor;
+  List<TextPainter> _tps = const [];
+  List<Color> _colors = const [];
+
+  void _rebuildCache(List<Detection> list) {
+    _cachedFor = list;
+    for (final t in _tps) {
+      t.dispose();
+    }
+    _tps = [
+      for (final d in list)
+        TextPainter(
+          text: TextSpan(
+            text: '${d.label} ${(d.score * 100).round()}%',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout(),
+    ];
+    // Colour follows the label, so it doesn't flicker when the list order
+    // changes between updates.
+    _colors = [
+      for (final d in list)
+        _palette[d.label.codeUnits.fold<int>(
+              0,
+              (a, b) => (a * 31 + b) & 0xffff,
+            ) %
+            _palette.length],
+    ];
+  }
+
   // Same palette as the web version, in order.
   static const _palette = [
     Color(0xFFFF4D4F),
@@ -568,6 +683,7 @@ class OutlinePainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final list = dets.value;
     if (list.isEmpty) return;
+    if (!identical(list, _cachedFor)) _rebuildCache(list);
 
     final y = yaw(), p = pitch();
     final f = 1.0 / math.tan(fov() * 0.5);
@@ -620,7 +736,7 @@ class OutlinePainter extends CustomPainter {
       }
       if (labelAt == null) continue; // fully off screen / behind
 
-      final color = _palette[i % _palette.length];
+      final color = _colors[i];
       if (allVisible) {
         path.close();
         _fill.color = color.withAlpha(46);
@@ -629,17 +745,7 @@ class OutlinePainter extends CustomPainter {
       _stroke.color = color;
       canvas.drawPath(path, _stroke);
 
-      final tp = TextPainter(
-        text: TextSpan(
-          text: '${d.label} ${(d.score * 100).round()}%',
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 11,
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-        textDirection: TextDirection.ltr,
-      )..layout();
+      final tp = _tps[i];
       final maxX = math.max(0.0, size.width - tp.width - 8);
       final maxY = math.max(0.0, size.height - tp.height - 2);
       final pos = Offset(
