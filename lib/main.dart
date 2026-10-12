@@ -111,6 +111,13 @@ class _X5PageState extends State<X5Page>
   StreamSubscription<UvcDeviceEvent>? _devSub;
   StreamSubscription<UvcStallEvent>? _stallSub;
 
+  int get _activeResultTtlMs {
+    if (!_scan360) return ApiConfig.resultTtlMs;
+
+    // Four scan views need time to complete a full refresh cycle.
+    return ApiConfig.resultTtlMs < 2400 ? 2400 : ApiConfig.resultTtlMs;
+  }
+
   void _log(String s) {
     debugPrint('X5 $s');
     if (_disposed) return;
@@ -268,22 +275,107 @@ class _X5PageState extends State<X5Page>
     if (wantApi) unawaited(_detect(img.clone()));
   }
 
+  double _angDeg(Offset a, Offset b) {
+    final lat = (0.5 - a.dy) * math.pi;
+
+    final dx = _wrapU(a.dx - b.dx) * 360 * math.cos(lat);
+    final dy = (a.dy - b.dy) * 180;
+
+    return math.sqrt(dx * dx + dy * dy);
+  }
+
   // Rolling detection. Each call handles ONE request: render a view from the
   // frame, send it, and put its outlines on screen the moment the answer
   // arrives.
   //   follow mode (default): the view is the one you are looking at right now
   //   scan mode: the fixed views of ApiConfig.views take turns
+
+  List<Detection> _retainBriefMisses({
+    required List<Detection>? previous,
+    required List<Detection> current,
+    required int captureMs,
+  }) {
+    if (previous == null || previous.isEmpty) {
+      return current;
+    }
+
+    final result = <Detection>[...current];
+    final matchedCurrent = <int>{};
+
+    for (final old in previous) {
+      if (old.points.length < 3 || old.capMs <= 0) {
+        continue;
+      }
+
+      final ageMs = captureMs - old.capMs;
+      if (ageMs < 0 || ageMs > ApiConfig.missingHoldMs) {
+        continue;
+      }
+
+      final oldCenter = _centroidUv(old.points);
+
+      var bestIndex = -1;
+      var bestDistance = ApiConfig.matchMaxDeg;
+
+      for (int i = 0; i < current.length; i++) {
+        if (matchedCurrent.contains(i)) continue;
+
+        final candidate = current[i];
+        if (candidate.points.length < 3 || candidate.label != old.label) {
+          continue;
+        }
+
+        final distance = _angDeg(oldCenter, _centroidUv(candidate.points));
+
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          bestIndex = i;
+        }
+      }
+
+      if (bestIndex >= 0) {
+        matchedCurrent.add(bestIndex);
+      } else {
+        // Preserve the original timestamp: the old detection must expire.
+        result.add(old);
+      }
+    }
+
+    return result;
+  }
+
+  double _wrapU(double dx) => dx - (dx + 0.5).floorToDouble();
+
+  Offset _centroidUv(List<Offset> pts) {
+    if (pts.isEmpty) return Offset.zero;
+
+    final referenceX = pts.first.dx;
+    double sx = 0;
+    double sy = 0;
+
+    for (final p in pts) {
+      sx += _wrapU(p.dx - referenceX);
+      sy += p.dy;
+    }
+
+    return Offset(referenceX + sx / pts.length, sy / pts.length);
+  }
+
   Future<void> _detect(ui.Image frame360) async {
     final sw = Stopwatch()..start();
     bool failed = false;
+
     final scan = _scan360;
-    final capMs = _clock.elapsedMilliseconds; // this frame is on screen now
+    final capMs = _clock.elapsedMilliseconds;
     final seq = _cycleId++;
     final cursor = _viewCursor++;
+
     final nShaders = _viewShaders.length;
-    int slot;
-    int shaderIdx;
-    ViewSpec spec;
+
+    late final int slot;
+    late final int shaderIdx;
+    late final ViewSpec spec;
+
     if (scan) {
       slot = cursor % ApiConfig.views.length;
       shaderIdx = slot;
@@ -293,30 +385,63 @@ class _X5PageState extends State<X5Page>
       shaderIdx = nShaders == 0 ? 0 : cursor % nShaders;
       spec = ViewSpec.fromAngles(_yaw, _pitch, _followFov());
     }
+
     final frameId = '${_api.tag}-$seq-$slot';
+
     try {
-      ui.Image view;
+      late final ui.Image view;
+
       try {
-        if (nShaders != ApiConfig.views.length) throw 'shader not ready';
+        if (nShaders != ApiConfig.views.length) {
+          throw StateError('Detection shaders are not ready');
+        }
+
         view = await renderView(_viewShaders[shaderIdx], frame360, spec);
       } finally {
         frame360.dispose();
       }
+
       final renderMs = sw.elapsedMilliseconds;
       final (list, encMs, netMs) = await _detectView(view, frameId);
+
       if (_disposed || scan != _scan360) return;
 
-      // an older answer that arrives after a newer one is thrown away
-      if (seq > _viewSeq[slot]) {
-        _viewSeq[slot] = seq;
-        final mapped = addMotion(_viewDets[slot], _viewCapMs[slot], [
-          for (final d in list) mapViewDetection(d, spec),
-        ], capMs);
-        _viewDets[slot] = mapped;
-        _viewAtMs[slot] = _clock.elapsedMilliseconds;
-        _viewCapMs[slot] = capMs;
-        _publishDets();
+      // Reject results that took too long to reach the UI.
+      final responseAgeMs = _clock.elapsedMilliseconds - capMs;
+      if (responseAgeMs > ApiConfig.maxResultAgeMs) {
+        _apiLastErr = 'Dropped stale result: ${responseAgeMs}ms';
+        return;
       }
+
+      // A newer result for this view may have completed first.
+      if (seq <= _viewSeq[slot]) return;
+
+      _viewSeq[slot] = seq;
+
+      final previous = _viewDets[slot];
+
+      final mapped = <Detection>[
+        for (final d in list) mapViewDetection(d, spec),
+      ];
+
+      // Preserve existing motion matching / timestamps.
+      final tracked = addMotion(previous, _viewCapMs[slot], mapped, capMs);
+
+      // Briefly bridge single-frame detector misses.
+      final stabilized = _retainBriefMisses(
+        previous: previous,
+        current: tracked,
+        captureMs: capMs,
+      );
+
+      _viewDets[slot] = stabilized;
+
+      // Keep response time separate from capture time.
+      _viewAtMs[slot] = _clock.elapsedMilliseconds;
+      _viewCapMs[slot] = capMs;
+
+      _publishDets();
+
       _apiOk++;
       _apiMsAcc += sw.elapsedMilliseconds;
       _renderMsAcc += renderMs;
@@ -329,10 +454,12 @@ class _X5PageState extends State<X5Page>
       _apiLastErr = '$e';
       _apiFailStreak++;
     } finally {
-      _apiInFlight--;
+      if (_apiInFlight > 0) _apiInFlight--;
+
       final wait = failed
           ? (250 * _apiFailStreak).clamp(250, 2000).toInt()
           : ApiConfig.minIntervalMs;
+
       _nextApiMs = _clock.elapsedMilliseconds + wait;
     }
   }
@@ -344,17 +471,24 @@ class _X5PageState extends State<X5Page>
   }
 
   // Show the latest answers (ignoring stale views).
+
   void _publishDets() {
     final now = _clock.elapsedMilliseconds;
+    final ttlMs = _activeResultTtlMs;
+
     final fresh = <List<Detection>?>[
       for (int i = 0; i < _viewDets.length; i++)
-        (_viewDets[i] != null && now - _viewAtMs[i] <= ApiConfig.resultTtlMs)
+        (_viewDets[i] != null &&
+                _viewAtMs[i] > 0 &&
+                now - _viewAtMs[i] <= ttlMs)
             ? _viewDets[i]
             : null,
     ];
+
     _dets.value = _scan360
         ? mergeViews(fresh)
         : (fresh[0] ?? const <Detection>[]);
+
     _detAtMs = now;
   }
 
@@ -364,6 +498,31 @@ class _X5PageState extends State<X5Page>
       _viewCapMs[i] = 0;
     }
     _dets.value = const [];
+  }
+
+  double _trackWrapU(double dx) => dx - (dx + 0.5).floorToDouble();
+
+  Offset _trackCentroidUv(List<Offset> points) {
+    if (points.isEmpty) return Offset.zero;
+
+    final referenceX = points.first.dx;
+    double sx = 0;
+    double sy = 0;
+
+    for (final point in points) {
+      sx += _trackWrapU(point.dx - referenceX);
+      sy += point.dy;
+    }
+
+    return Offset(referenceX + sx / points.length, sy / points.length);
+  }
+
+  double _trackDistanceDeg(Offset a, Offset b) {
+    final latitude = (0.5 - a.dy) * math.pi;
+    final dx = _trackWrapU(a.dx - b.dx) * 360 * math.cos(latitude);
+    final dy = (a.dy - b.dy) * 180;
+
+    return math.sqrt(dx * dx + dy * dy);
   }
 
   // Returns the detections, the time spent reading + encoding the view, and
@@ -402,8 +561,7 @@ class _X5PageState extends State<X5Page>
     final nowMs = _clock.elapsedMilliseconds;
     bool expired = false;
     for (int i = 0; i < _viewDets.length; i++) {
-      if (_viewDets[i] != null &&
-          nowMs - _viewAtMs[i] > ApiConfig.resultTtlMs) {
+      if (_viewDets[i] != null && nowMs - _viewAtMs[i] > _activeResultTtlMs) {
         _viewDets[i] = null;
         expired = true;
       }

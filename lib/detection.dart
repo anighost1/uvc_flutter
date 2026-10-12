@@ -82,8 +82,7 @@ class ApiConfig {
   /// server busy while the next view is being rendered and encoded. The
   /// server handles frames one by one, so more than 2-3 only adds waiting.
   static const int maxInFlight = 2;
-  static int get inFlightLimit =>
-      maxInFlight < views.length ? maxInFlight : views.length;
+  static const int inFlightLimit = 1;
 
   /// Background isolates that encode views to JPEG.
   static const int encoderIsolates = 2;
@@ -96,7 +95,7 @@ class ApiConfig {
   // ---- hiding the delay: moving outlines are predicted forward ----
 
   /// An outline is moved along its measured speed for at most this long.
-  static const int maxExtrapolateMs = 400;
+  static const int maxExtrapolateMs = 0;
 
   /// A new outline is matched to the same label in the previous answer if it
   /// is closer than this (degrees on the sphere).
@@ -116,6 +115,12 @@ class ApiConfig {
   /// true = no network, returns a fake circle in the middle of every view.
   /// Use it to check that the outlines line up with the preview.
   static const bool useMock = false;
+
+  // Maximum age of a detection result when it returns from the server.
+  static const int maxResultAgeMs = 900;
+
+  // Retain a previously detected object briefly if a single response misses it.
+  static const int missingHoldMs = 500;
 }
 
 // =====================================================================
@@ -250,27 +255,67 @@ List<double> _centroidDir(List<Offset> pts) {
 /// that view did not answer, the other views' result is kept instead.
 /// `perView[i]` holds view i's detections, already in 360-frame coordinates,
 /// or null if that view failed.
+
 List<Detection> mergeViews(List<List<Detection>?> perView) {
   final centers = [for (final v in ApiConfig.views) _dirOfView(v)];
+
+  const duplicateAngleDeg = 12.0;
+  final duplicateDot = math.cos(duplicateAngleDeg * math.pi / 180.0);
+
   final out = <Detection>[];
+
+  // Prefer detections from the view looking most directly at the object.
+  final candidates = <({Detection detection, int viewIndex})>[];
+
   for (int i = 0; i < perView.length; i++) {
-    final list = perView[i];
-    if (list == null) continue;
-    for (final d in list) {
-      final c = _centroidDir(d.points);
-      int best = 0;
-      double bestDot = -2;
-      for (int k = 0; k < centers.length; k++) {
-        final dot =
-            c[0] * centers[k][0] + c[1] * centers[k][1] + c[2] * centers[k][2];
-        if (dot > bestDot) {
-          bestDot = dot;
-          best = k;
-        }
-      }
-      if (best == i || perView[best] == null) out.add(d);
+    final detections = perView[i];
+    if (detections == null) continue;
+
+    for (final d in detections) {
+      if (d.points.isEmpty) continue;
+      candidates.add((detection: d, viewIndex: i));
     }
   }
+
+  final consumed = List<bool>.filled(candidates.length, false);
+
+  for (int i = 0; i < candidates.length; i++) {
+    if (consumed[i]) continue;
+
+    final current = candidates[i];
+    final d = current.detection;
+    final c = _centroidDir(d.points);
+
+    int preferred = i;
+    double preferredDot = -2;
+
+    // Find all same-label detections that appear to be duplicates.
+    for (int j = i; j < candidates.length; j++) {
+      if (consumed[j]) continue;
+
+      final other = candidates[j];
+      if (other.detection.label != d.label) continue;
+
+      final oc = _centroidDir(other.detection.points);
+      final dot = c[0] * oc[0] + c[1] * oc[1] + c[2] * oc[2];
+
+      if (j != i && dot < duplicateDot) continue;
+
+      final center = centers[other.viewIndex];
+      final viewDot = oc[0] * center[0] + oc[1] * center[1] + oc[2] * center[2];
+
+      if (viewDot > preferredDot) {
+        preferredDot = viewDot;
+        preferred = j;
+      }
+
+      if (j != i) consumed[j] = true;
+    }
+
+    consumed[i] = true;
+    out.add(candidates[preferred].detection);
+  }
+
   return out;
 }
 
@@ -497,7 +542,29 @@ class DetectionClient {
     socket.onConnectError((e) => onLog?.call('Socket connect error: $e'));
 
     socket.on(ApiConfig.resultEvent, _onResult);
-    socket.on(ApiConfig.errorEvent, (err) => _failAll('server error: $err'));
+    socket.on(ApiConfig.errorEvent, (dynamic data) {
+      dynamic root = data;
+
+      if (root is String) {
+        try {
+          root = jsonDecode(root);
+        } catch (_) {
+          return;
+        }
+      }
+
+      if (root is! Map) return;
+
+      final id = root['frameId']?.toString();
+      if (id == null) return;
+
+      final pending = _pending.remove(id);
+      if (pending == null || pending.completer.isCompleted) return;
+
+      pending.completer.completeError(
+        'server error: ${root['error'] ?? 'Unknown error'}',
+      );
+    });
   }
 
   void _onResult(dynamic data) {
@@ -849,54 +916,101 @@ class OutlinePainter extends CustomPainter {
 
     for (int i = 0; i < list.length; i++) {
       final d = list[i];
-      final path = Path();
-      bool pen = false;
-      bool allVisible = true;
-      Offset? labelAt;
-      final dtMs = (nowMs() - d.capMs)
-          .clamp(0, ApiConfig.maxExtrapolateMs)
-          .toDouble();
-      final ox = d.vel.dx * dtMs, oy = d.vel.dy * dtMs;
-      for (final uv0 in d.points) {
-        final s = project(
-          Offset(uv0.dx + ox, (uv0.dy + oy).clamp(0.0, 1.0).toDouble()),
-        );
-        if (s == null) {
-          pen = false;
-          allVisible = false;
-          continue;
-        }
-        if (pen) {
-          path.lineTo(s.dx, s.dy);
-        } else {
-          path.moveTo(s.dx, s.dy);
-        }
-        pen = true;
-        if (labelAt == null || s.dy < labelAt.dy) labelAt = s;
-      }
-      if (labelAt == null) continue; // fully off screen / behind
+      if (d.points.length < 3) continue;
 
       final color = _colors[i];
-      if (allVisible) {
+
+      // First test whether the whole contour can be projected.
+      final projected = <Offset>[];
+      bool allVisible = true;
+
+      for (final uv in d.points) {
+        final s = project(uv);
+        if (s == null) {
+          allVisible = false;
+          break;
+        }
+        projected.add(s);
+      }
+
+      final path = Path();
+      Offset? labelAt;
+
+      if (allVisible && projected.length >= 3) {
+        path.moveTo(projected.first.dx, projected.first.dy);
+
+        for (int j = 1; j < projected.length; j++) {
+          path.lineTo(projected[j].dx, projected[j].dy);
+        }
+
         path.close();
+
+        for (final s in projected) {
+          if (labelAt == null || s.dy < labelAt.dy) {
+            labelAt = s;
+          }
+        }
+
         _fill.color = color.withAlpha(46);
         canvas.drawPath(path, _fill);
+        _stroke.color = color;
+        canvas.drawPath(path, _stroke);
+      } else {
+        // Draw only short visible runs. Never connect across a point
+        // that is behind the camera.
+        var run = <Offset>[];
+
+        void flushRun() {
+          if (run.length >= 2) {
+            final segment = Path()..moveTo(run.first.dx, run.first.dy);
+
+            for (int j = 1; j < run.length; j++) {
+              segment.lineTo(run[j].dx, run[j].dy);
+            }
+
+            _stroke.color = color;
+            canvas.drawPath(segment, _stroke);
+          }
+
+          run = <Offset>[];
+        }
+
+        for (final uv in d.points) {
+          final s = project(uv);
+
+          if (s == null) {
+            flushRun();
+            continue;
+          }
+
+          run.add(s);
+
+          if (labelAt == null || s.dy < labelAt.dy) {
+            labelAt = s;
+          }
+        }
+
+        flushRun();
       }
-      _stroke.color = color;
-      canvas.drawPath(path, _stroke);
+
+      if (labelAt == null) continue;
 
       final tp = _tps[i];
       final maxX = math.max(0.0, size.width - tp.width - 8);
       final maxY = math.max(0.0, size.height - tp.height - 2);
+
       final pos = Offset(
         labelAt.dx.clamp(6.0, maxX + 6).toDouble(),
         (labelAt.dy - tp.height - 4).clamp(0.0, maxY).toDouble(),
       );
-      _labelBg.color = const Color(0xB3000000); // rgba(0,0,0,0.7) like the web
+
+      _labelBg.color = const Color(0xB3000000);
+
       canvas.drawRect(
         Rect.fromLTWH(pos.dx - 6, pos.dy, tp.width + 12, tp.height + 2),
         _labelBg,
       );
+
       tp.paint(canvas, Offset(pos.dx, pos.dy + 1));
     }
   }
